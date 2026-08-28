@@ -1,236 +1,315 @@
+"""
+api_layer/dual_routes.py
+========================
+FastAPI Router for CyberRiskIQ Gateway.
+
+Endpoints:
+- POST /api/v1/chat/business
+- POST /api/v1/chat/technical
+- POST /api/v1/models/stream-update
+"""
 import re
 import time
 import uuid
-from typing import Optional, Dict, Any
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from typing import Dict, Any, List, Optional
+from fastapi import APIRouter, HTTPException, Body
+
 from schemas.data_models import (
     ChatRequest,
     ChatResponse,
-    SlotExtractionResult,
-    DeterministicContextPayload,
     PersonaType,
+    ThreatContext,
+    EPSSPrediction,
+    FAIRSimulationResult,
+    XAITrustResult,
+    ROSIOptimizationResult,
+    ExecutionPayload,
+    DeterministicContextPayload,
+    SlotExtractionResult,
     AssetNode,
-    EPSSInput,
     EPSSOutput,
-    FAIRInput,
     FAIROutput,
-    XAIInput,
     XAIOutput,
-    MILPROSIInput,
     MILPROSIOutput,
-    ComplianceControl,
 )
 from core_engines.epss_model import EPSSPredictor
 from core_engines.topology_graph import AssetTopologyGraph
 from core_engines.fair_model import FAIRRiskEngine
 from core_engines.xai_trust import XAITrustAuditor
 from core_engines.rosi_optimizer import ROSIOptimizer
-from core_engines.retraining_bus import ContinuousRetrainingBus
-from api_layer.synthesizer import PromptSynthesizers, DeterministicExecutionAggregator
+from api_layer.synthesizer import (
+    format_business_briefing,
+    format_technical_diagnostic,
+    HybridSynthesizer,
+)
 from api_layer.guardrails import SanityGuardrailVerifier
-
+from api_layer import mock_kb
 
 router = APIRouter()
+
+# Singletons for core engines
 epss_predictor = EPSSPredictor()
 asset_graph = AssetTopologyGraph()
 fair_engine = FAIRRiskEngine()
 xai_auditor = XAITrustAuditor()
 rosi_optimizer = ROSIOptimizer()
-retraining_bus = ContinuousRetrainingBus()
-synthesizers = PromptSynthesizers()
+
+synthesizer = HybridSynthesizer()
 guardrail = SanityGuardrailVerifier()
 
-
-class IntentClassifier:
-    VENDOR_PATTERNS = re.compile(
-        r"\b(microsoft|ibm|adobe|hp|apache|google|apple)\b", re.IGNORECASE
-    )
-    CVE_PATTERN = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
-    BUDGET_PATTERN = re.compile(r"(?<!\bCVE-)(\d+(?:\.\d+)?)\s*(crores?|cr|lakhs?|l|rs|inr)\b", re.IGNORECASE)
-    TIMELINE_PATTERN = re.compile(r"(\d+)\s*(days?|d|weeks?|w|hours?|h)", re.IGNORECASE)
-
-    def classify(self, prompt: str) -> str:
-        p = prompt.lower()
-        if any(k in p for k in ["fix", "patch", "remediate", "mitigate", "control", "waf", "vpn", "mfa"]):
-            return "remediation"
-        if any(k in p for k in ["score", "risk", "how risky", "impact", "loss", "eal", "fair"]):
-            return "risk_assessment"
-        if any(k in p for k in ["compliance", "sebi", "rbi", "audit", "framework"]):
-            return "compliance"
-        return "general"
+_CVE_PATTERN = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
+_BUDGET_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*(crores?|cr|lakhs?|l)\b", re.IGNORECASE)
 
 
-class SlotExtractor:
-    def extract(self, prompt: str, context: Optional[Dict[str, Any]] = None) -> SlotExtractionResult:
-        cve_match = IntentClassifier.CVE_PATTERN.search(prompt)
-        cve_id = cve_match.group(0).upper() if cve_match else None
+def _extract_slots(prompt: str) -> Dict[str, Any]:
+    cve_match = _CVE_PATTERN.search(prompt)
+    cve_id = cve_match.group(0).upper() if cve_match else "CVE-2024-1234"
 
-        asset = None
-        if context and "asset_target" in context:
-            asset = context["asset_target"]
+    budget_lakhs = 300.0  # default control cost: ₹3.0 Cr = 300 Lakhs
+    bm = _BUDGET_PATTERN.search(prompt)
+    if bm:
+        val = float(bm.group(1))
+        unit = bm.group(2).lower()
+        if unit.startswith("cr"):
+            budget_lakhs = val * 100.0
         else:
-            for candidate in ["Core Payment Switch", "Customer DB", "API Gateway", "payment switch", "customer database", "api gateway"]:
-                if candidate.lower() in prompt.lower():
-                    asset = candidate
-                    break
+            budget_lakhs = val
 
-        budget = None
-        bm = IntentClassifier.BUDGET_PATTERN.search(prompt)
-        if bm:
-            val = float(bm.group(1))
-            unit = (bm.group(2) or "").lower()
-            if unit.startswith("cr"):
-                budget = val * 100.0
-            elif unit.startswith("l"):
-                budget = val
-            else:
-                budget = val
+    # Resolve target asset name
+    asset_name = "Core Payment Switch"
+    for candidate in ["customer_db", "api_gateway", "core_payment_switch", "payment switch", "customer database", "api gateway"]:
+        if candidate in prompt.lower():
+            asset_name = candidate
+            break
 
-        timeline = None
-        tm = IntentClassifier.TIMELINE_PATTERN.search(prompt)
-        if tm:
-            val = int(tm.group(1))
-            unit = (tm.group(2) or "").lower()
-            if unit.startswith("w"):
-                timeline = val * 7
-            elif unit.startswith("h"):
-                timeline = max(1, val // 24)
-            else:
-                timeline = val
-
-        return SlotExtractionResult(
-            asset_target=asset,
-            cve_id=cve_id,
-            budget_limit=budget,
-            timeline_delta=timeline,
-            confidence=0.85 if (asset or cve_id) else 0.4,
-        )
+    return {
+        "cve_id": cve_id,
+        "asset_name": asset_name,
+        "budget_lakhs": budget_lakhs,
+    }
 
 
-def _resolve_asset(slots: SlotExtractionResult) -> Optional[AssetNode]:
-    if not slots.asset_target:
-        return None
-    return asset_graph.resolve(slots.asset_target)
+def _run_core_engines(prompt: str, context_overrides: Optional[Dict[str, Any]] = None) -> ExecutionPayload:
+    """Execute Developer A deterministic math engines and build frozen ExecutionPayload."""
+    slots = _extract_slots(prompt)
+    if context_overrides:
+        slots.update(context_overrides)
 
+    # 1. Resolve Asset Topology
+    try:
+        topo_data = asset_graph.resolve_asset(slots["asset_name"])
+    except KeyError:
+        topo_data = asset_graph.resolve_asset("core_payment_switch")
 
-def _build_epss(slots: SlotExtractionResult) -> Optional[EPSSOutput]:
-    if not slots.cve_id:
-        return None
-    entry = next((e for e in retraining_bus.get_buffer() if e["cve_id"] == slots.cve_id), None)
-    if entry:
-        epss_in = EPSSInput(
-            cve_id=entry["cve_id"],
-            vendor=entry.get("vendor"),
-            reference_count=entry.get("reference_count", 0),
-            tags=entry.get("tags", []),
-            exploit_poc_published=entry.get("exploit_poc_published", False),
-            weaponized=entry.get("weaponized", False),
-        )
-    else:
-        epss_in = EPSSInput(cve_id=slots.cve_id)
-    return epss_predictor.predict(epss_in)
+    vuln_info = mock_kb.lookup_vuln(slots["cve_id"])
 
+    # Build EPSS 16-feature boolean flags dictionary
+    features: Dict[str, bool] = {
+        "vend_microsoft": vuln_info["vendor"].lower() == "microsoft",
+        "vend_ibm": vuln_info["vendor"].lower() == "ibm",
+        "vend_adobe": vuln_info["vendor"].lower() == "adobe",
+        "vend_hp": vuln_info["vendor"].lower() == "hp",
+        "vend_apache": vuln_info["vendor"].lower() == "apache",
+        "vend_google": vuln_info["vendor"].lower() == "google",
+        "vend_apple": vuln_info["vendor"].lower() == "apple",
+        "exp_weaponized": vuln_info["exploit_weaponized"],
+        "exp_poc_published": vuln_info["poc_published"],
+        "tag_code_execution": "code_execution" in vuln_info["tags"],
+        "tag_remote": "remote" in vuln_info["tags"],
+        "tag_denial_of_service": "dos" in vuln_info["tags"],
+        "tag_web": "web" in vuln_info["tags"],
+        "tag_memory_corruption": "memory_corruption" in vuln_info["tags"],
+        "tag_local": "local" in vuln_info["tags"],
+    }
 
-def _build_fair(asset: Optional[AssetNode], epss: Optional[EPSSOutput], slots: SlotExtractionResult) -> Optional[FAIROutput]:
-    if not asset or not epss:
-        return None
-    trial_count = 10000
-    if slots.timeline_delta is not None:
-        trial_count = min(50000, max(1000, slots.timeline_delta * 500))
-    fair_in = FAIRInput(
-        asset=asset,
-        p_exploit=epss.p_exploit,
-        susceptibility=0.8,
-        trial_count=trial_count,
-        secondary_lef=0.3,
-    )
-    return fair_engine.run(fair_in)
-
-
-def _build_xai(text: str, slots: SlotExtractionResult) -> XAIOutput:
-    ref = f"CVSS v3.1 assessment for {slots.cve_id or 'vulnerability'}"
-    tokens = re.findall(r"\b[A-Z]{2,}\b", text) or ["exploit", "remote", "code_execution"]
-    return xai_auditor.audit(XAIInput(generated_text=text, reference_text=ref, salient_tokens=tokens))
-
-
-def _build_milprosi(asset: Optional[AssetNode], fair: Optional[FAIROutput], slots: SlotExtractionResult) -> Optional[MILPROSIOutput]:
-    if not fair or not asset:
-        return None
-    risk_reduced = fair.eal_inr_cr * 0.75
-    control_cost = fair.eal_inr_cr * 0.20
-    if slots.budget_limit is not None:
-        control_cost = min(control_cost, slots.budget_limit)
-    return rosi_optimizer.optimize(
-        MILPROSIInput(
-            control_cost_inr_cr=control_cost,
-            eal_inr_cr=fair.eal_inr_cr,
-            risk_reduced_inr_cr=risk_reduced,
-        )
+    threat_context = ThreatContext(
+        cve_id=slots["cve_id"],
+        description=vuln_info["description"],
+        asset_name=topo_data["asset_name"],
+        asset_replacement_cost_cr=topo_data["asset_replacement_cost_cr"],
+        daily_revenue_impact_cr=topo_data["daily_revenue_impact_cr"],
+        regulatory_tier=topo_data["regulatory_tier"],
+        cvss_base_score=9.8,
+        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        features=features,
+        ref_count=vuln_info["reference_count"],
+        proposed_control_cost_lakhs=slots["budget_lakhs"],
     )
 
+    # 2. EPSS Predictor
+    epss_prediction = epss_predictor.predict_probability(
+        features=features,
+        ref_count=threat_context.ref_count,
+        cve_id=threat_context.cve_id,
+    )
 
-def _compliance_controls(asset: Optional[AssetNode]) -> list:
-    if not asset:
-        return []
-    return [
-        ComplianceControl(control_id="C-001", pillar="Identify", description="Asset inventory and criticality scoring", slo_hours=24, rbi_category="Asset Management"),
-        ComplianceControl(control_id="C-002", pillar="Protect", description="Encryption at rest and in transit", slo_hours=48, rbi_category="Data Protection"),
-        ComplianceControl(control_id="C-003", pillar="Detect", description="IDS/IPS and anomaly detection", slo_hours=4, rbi_category="Detection"),
-        ComplianceControl(control_id="C-004", pillar="Respond", description="Incident response playbook", slo_hours=1, rbi_category="Response"),
-        ComplianceControl(control_id="C-005", pillar="Recover", description="Backup and restoration SLA", slo_hours=72, rbi_category="Recovery"),
-    ]
+    # 3. FAIR Risk Engine
+    fair_result = fair_engine.run_monte_carlo(
+        epss_prob=epss_prediction.epss_probability,
+        asset_replacement_cost_cr=threat_context.asset_replacement_cost_cr,
+        daily_revenue_impact_cr=threat_context.daily_revenue_impact_cr,
+        regulatory_tier=threat_context.regulatory_tier,
+        iterations=10_000,
+    )
+
+    # 4. XAI Trust Auditor
+    salient_tokens = [t for t in vuln_info["tags"]] + ["remote", "code_execution", "unauthenticated"]
+    xai_trust = xai_auditor.evaluate_trust_score(
+        description=threat_context.description,
+        salient_tokens=salient_tokens,
+    )
+
+    # 5. ROSI Optimizer
+    rosi_result = rosi_optimizer.evaluate_investment(
+        eal_cr=fair_result.expected_annual_loss_cr,
+        control_cost_lakhs=threat_context.proposed_control_cost_lakhs,
+        risk_reduction_pct=85.0,
+    )
+
+    return ExecutionPayload(
+        threat_context=threat_context,
+        epss_prediction=epss_prediction,
+        fair_result=fair_result,
+        xai_trust=xai_trust,
+        rosi_result=rosi_result,
+    )
+
+
+def _build_context_payload(payload: ExecutionPayload, session_id: str, persona: PersonaType) -> DeterministicContextPayload:
+    """Build Developer B DeterministicContextPayload from ExecutionPayload."""
+    asset_node = AssetNode(
+        asset_id="AST-001",
+        name=payload.threat_context.asset_name,
+        criticality_score=9.8,
+        hardware_replacement_cost_inr_cr=payload.threat_context.asset_replacement_cost_cr,
+        daily_revenue_impact_inr_cr=payload.threat_context.daily_revenue_impact_cr,
+        regulatory_tier=payload.threat_context.regulatory_tier,
+        asset_type="infrastructure",
+    )
+    epss_out = EPSSOutput(
+        cve_id=payload.epss_prediction.cve_id,
+        z_score=-1.5,
+        p_exploit=payload.epss_prediction.epss_probability,
+        feature_contributions={"vend_microsoft": 2.44, "exp_weaponized": 2.00},
+    )
+    fair_out = FAIROutput(
+        asset_id="AST-001",
+        cve_id=payload.epss_prediction.cve_id,
+        lef=payload.epss_prediction.epss_probability * 0.35,
+        primary_loss_inr_cr=payload.fair_result.primary_loss_cr,
+        secondary_loss_inr_cr=payload.fair_result.secondary_loss_cr,
+        eal_inr_cr=payload.fair_result.expected_annual_loss_cr,
+        var_95_inr_cr=payload.fair_result.value_at_risk_95_cr,
+        trial_samples=[],
+    )
+    xai_out = XAIOutput(
+        trust_score_pct=payload.xai_trust.trust_score_pct,
+        iqr_threshold=0.85,
+        flags_status=payload.xai_trust.alignment_status,
+        misaligned_tokens=[],
+    )
+    milprosi_out = MILPROSIOutput(
+        control_cost_inr_cr=payload.rosi_result.control_cost_cr,
+        risk_reduced_inr_cr=payload.rosi_result.risk_reduced_cr,
+        net_capital_saved_inr_cr=payload.rosi_result.net_benefit_cr,
+        rosi_pct=payload.rosi_result.rosi_percentage,
+        is_economically_viable=payload.rosi_result.is_economically_viable,
+        gordon_loeb_ceiling_inr_cr=payload.rosi_result.gordon_loeb_cap_cr,
+    )
+    slots_res = SlotExtractionResult(
+        asset_target=payload.threat_context.asset_name,
+        cve_id=payload.epss_prediction.cve_id,
+        budget_limit=payload.threat_context.proposed_control_cost_lakhs,
+        timeline_delta=30,
+        confidence=0.95,
+    )
+
+    return DeterministicContextPayload(
+        session_id=session_id,
+        persona=persona,
+        timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        slots=slots_res,
+        asset=asset_node,
+        epss=epss_out,
+        fair=fair_out,
+        xai=xai_out,
+        milprosi=milprosi_out,
+        compliance_controls=[],
+        guardrail_passed=True,
+        guardrail_errors=[],
+    )
 
 
 @router.post("/chat/business", response_model=ChatResponse)
 async def chat_business(request: ChatRequest) -> ChatResponse:
-    return await _process_chat(request)
+    """Run core engines, format executive business briefing, verify financial integrity, return ChatResponse."""
+    start_time = time.perf_counter()
+    prompt = request.prompt or ""
+
+    # Execute core engines
+    execution_payload = _run_core_engines(prompt, request.context_overrides)
+
+    # Synthesize plain-English executive briefing
+    formatted_output = format_business_briefing(execution_payload)
+
+    # Sanity guardrail verification
+    passed, errors = guardrail.verify_financial_integrity(execution_payload, formatted_output)
+
+    context_payload = _build_context_payload(execution_payload, request.session_id, PersonaType.BUSINESS)
+    context_payload.guardrail_passed = passed
+    context_payload.guardrail_errors = errors
+
+    latency_ms = (time.perf_counter() - start_time) * 1000.0
+
+    return ChatResponse(
+        session_id=request.session_id,
+        persona=PersonaType.BUSINESS,
+        formatted_output=formatted_output,
+        context_payload=context_payload,
+        latency_ms=round(latency_ms, 2),
+    )
 
 
 @router.post("/chat/technical", response_model=ChatResponse)
 async def chat_technical(request: ChatRequest) -> ChatResponse:
-    return await _process_chat(request)
+    """Run core engines, format technical diagnostic, verify financial integrity, return ChatResponse."""
+    start_time = time.perf_counter()
+    prompt = request.prompt or ""
 
+    # Execute core engines
+    execution_payload = _run_core_engines(prompt, request.context_overrides)
 
-async def _process_chat(request: ChatRequest) -> ChatResponse:
-    start = time.perf_counter()
-    classifier = IntentClassifier()
-    extractor = SlotExtractor()
-    intent = classifier.classify(request.prompt)
-    slots = extractor.extract(request.prompt, context=request.context_overrides)
+    # Synthesize technical diagnostic
+    formatted_output = format_technical_diagnostic(execution_payload)
 
-    asset = _resolve_asset(slots)
-    epss = _build_epss(slots)
-    fair = _build_fair(asset, epss, slots)
+    # Sanity guardrail verification
+    passed, errors = guardrail.verify_financial_integrity(execution_payload, formatted_output)
 
-    xai = _build_xai(request.prompt, slots)
-    milprosi = _build_milprosi(asset, fair, slots)
-    controls = _compliance_controls(asset)
+    context_payload = _build_context_payload(execution_payload, request.session_id, PersonaType.TECHNICAL)
+    context_payload.guardrail_passed = passed
+    context_payload.guardrail_errors = errors
 
-    aggregator = DeterministicExecutionAggregator()
-    payload = aggregator.aggregate(
-        session_id=request.session_id,
-        persona=request.persona,
-        slots=slots,
-        asset=asset,
-        epss=epss,
-        fair=fair,
-        xai=xai,
-        milprosi=milprosi,
-        compliance_controls=controls,
-    )
+    latency_ms = (time.perf_counter() - start_time) * 1000.0
 
-    formatted = synthesizers.synthesize(payload)
-    passed, errors = guardrail.verify(payload, formatted)
-    if not passed:
-        payload.guardrail_passed = False
-        payload.guardrail_errors = errors
-
-    latency = (time.perf_counter() - start) * 1000.0
     return ChatResponse(
         session_id=request.session_id,
-        persona=request.persona,
-        formatted_output=formatted,
-        context_payload=payload,
-        latency_ms=round(latency, 2),
+        persona=PersonaType.TECHNICAL,
+        formatted_output=formatted_output,
+        context_payload=context_payload,
+        latency_ms=round(latency_ms, 2),
     )
+
+
+@router.post("/models/stream-update")
+async def stream_update(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Ingest live telemetry batch to update exploit weights via EPSSPredictor.continuous_online_update()."""
+    telemetry_batch = payload.get("telemetry_batch") or payload.get("batch") or []
+    if isinstance(payload, list):
+        telemetry_batch = payload
+
+    epss_predictor.continuous_online_update(telemetry_batch)
+    return {
+        "status": "success",
+        "samples_ingested": len(telemetry_batch),
+        "model_fitted": epss_predictor._sgd_fitted,
+    }

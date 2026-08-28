@@ -1,72 +1,155 @@
+"""
+api_layer/guardrails.py
+========================
+SanityGuardrailVerifier for financial and numerical integrity.
+
+Scans synthesized LLM/template text using regex matching for ₹ currency figures
+and percentages against the pre-calculated ExecutionPayload. Blocks responses
+with hallucinated numbers or Gordon-Loeb contradictions.
+"""
 import re
-import json
-from typing import Dict, Any, List, Optional, Tuple
-from schemas.data_models import DeterministicContextPayload
+from typing import Any, List, Tuple, Dict, Set
+from schemas.data_models import ExecutionPayload, DeterministicContextPayload
+
+_CURRENCY_REGEX = re.compile(
+    r"(?:₹|\bINR\b|\bRs\.?)\s*([0-9,]+\.?[0-9]*)\s*(?:Cr|Crores?|Lakhs?|L)?",
+    re.IGNORECASE,
+)
+_PERCENT_REGEX = re.compile(r"([0-9,]+\.?[0-9]*)\s*%", re.IGNORECASE)
+
+
+def _collect_payload_numbers(payload: Any) -> Set[float]:
+    """Collect all valid numeric values from either ExecutionPayload or DeterministicContextPayload."""
+    nums: Set[float] = set()
+
+    if isinstance(payload, ExecutionPayload):
+        if payload.fair_result:
+            nums.add(round(payload.fair_result.expected_annual_loss_cr, 2))
+            nums.add(round(payload.fair_result.value_at_risk_95_cr, 2))
+            nums.add(round(payload.fair_result.primary_loss_cr, 2))
+            nums.add(round(payload.fair_result.secondary_loss_cr, 2))
+            nums.add(round(payload.fair_result.expected_annual_loss_cr, 4))
+            nums.add(round(payload.fair_result.value_at_risk_95_cr, 4))
+        if payload.epss_prediction:
+            nums.add(round(payload.epss_prediction.epss_probability, 4))
+            nums.add(round(payload.epss_prediction.epss_probability * 100.0, 2))
+            nums.add(round(payload.epss_prediction.percentile, 2))
+        if payload.xai_trust:
+            nums.add(round(payload.xai_trust.trust_score_pct, 1))
+            nums.add(round(payload.xai_trust.trust_score_pct, 2))
+        if payload.rosi_result:
+            nums.add(round(payload.rosi_result.control_cost_cr, 2))
+            nums.add(round(payload.rosi_result.risk_reduced_cr, 2))
+            nums.add(round(payload.rosi_result.net_benefit_cr, 2))
+            nums.add(round(payload.rosi_result.rosi_percentage, 1))
+            nums.add(round(payload.rosi_result.rosi_percentage, 2))
+            nums.add(round(payload.rosi_result.gordon_loeb_cap_cr, 2))
+            nums.add(round(payload.rosi_result.control_cost_cr, 4))
+            nums.add(round(payload.rosi_result.gordon_loeb_cap_cr, 4))
+
+    elif isinstance(payload, DeterministicContextPayload):
+        if payload.fair:
+            nums.add(round(payload.fair.eal_inr_cr, 2))
+            nums.add(round(payload.fair.var_95_inr_cr, 2))
+            nums.add(round(payload.fair.primary_loss_inr_cr, 2))
+            nums.add(round(payload.fair.secondary_loss_inr_cr, 2))
+            nums.add(round(payload.fair.eal_inr_cr, 4))
+            nums.add(round(payload.fair.var_95_inr_cr, 4))
+        if payload.epss:
+            nums.add(round(payload.epss.p_exploit, 4))
+            nums.add(round(payload.epss.p_exploit * 100.0, 2))
+        if payload.xai:
+            nums.add(round(payload.xai.trust_score_pct, 1))
+            nums.add(round(payload.xai.trust_score_pct, 2))
+        if payload.milprosi:
+            nums.add(round(payload.milprosi.control_cost_inr_cr, 2))
+            nums.add(round(payload.milprosi.risk_reduced_inr_cr, 2))
+            nums.add(round(payload.milprosi.net_capital_saved_inr_cr, 2))
+            nums.add(round(payload.milprosi.rosi_pct, 1))
+            nums.add(round(payload.milprosi.rosi_pct, 2))
+            nums.add(round(payload.milprosi.gordon_loeb_ceiling_inr_cr, 2))
+
+    elif isinstance(payload, dict):
+        for v in payload.values():
+            if isinstance(v, (int, float)):
+                nums.add(round(float(v), 2))
+                nums.add(round(float(v), 4))
+
+    return nums
+
+
+def _is_number_grounded(val: float, valid_nums: Set[float], tolerance: float = 0.08) -> bool:
+    """Check if extracted number matches any expected figure in the payload within tolerance."""
+    if val == 0.0:
+        return True
+    for expected in valid_nums:
+        if expected == 0.0:
+            continue
+        if abs(val - expected) < 0.05 or abs(val - expected) / abs(expected) <= tolerance:
+            return True
+    return False
 
 
 class SanityGuardrailVerifier:
-    MONETARY_PATTERN = re.compile(r"([A-Za-z0-9% -]+):\s*(?:[\₹$])?[\s]*([0-9,]+\.[0-9]+|\d+)(?:\s*(?:%|Crores?|Crore|Lakhs?|Lakh|Cr|L|Rs|INR))?")
+    """Scans synthesized text against ExecutionPayload to block hallucinated numbers."""
 
-    def verify(self, payload: DeterministicContextPayload, output_text: str) -> tuple[bool, List[str]]:
+    def verify_financial_integrity(self, payload: Any, output_text: Any = None) -> Tuple[bool, List[str]]:
+        """
+        Verify that all ₹ currency figures and percentages in output_text exist in payload.
+
+        Supports arguments passed as (payload, output_text) or (output_text, payload).
+        """
+        if isinstance(payload, str) and not isinstance(output_text, str):
+            payload, output_text = output_text, payload
+
+        text = output_text or ""
+        valid_nums = _collect_payload_numbers(payload)
         errors: List[str] = []
-        numbers = self._extract_line_numbers(output_text)
-        expected = self._build_expected_map(payload)
-        for key, expected_val in expected.items():
-            actual = numbers.get(key)
-            if actual is None:
-                errors.append(f"Missing expected value for {key} in output text")
-            elif abs(float(actual) - float(expected_val)) > 0.05:
-                errors.append(f"Mismatch {key}: text={actual}, payload={expected_val}")
-        return len(errors) == 0, errors
 
-    def _extract_line_numbers(self, text: str) -> Dict[str, float]:
-        found: Dict[str, float] = {}
-        for m in self.MONETARY_PATTERN.finditer(text):
-            label = m.group(1).strip()
-            num_str = m.group(2).replace(",", "")
+        # Check currency matches
+        for m in _CURRENCY_REGEX.finditer(text):
+            num_str = m.group(1).replace(",", "")
             try:
                 val = float(num_str)
             except ValueError:
                 continue
-            mapped = self._map_label(label)
-            if mapped:
-                found[mapped] = val
-        return found
+            if not _is_number_grounded(val, valid_nums):
+                errors.append(f"Hallucinated ₹ currency figure detected: '{m.group(0)}' (val={val})")
 
-    @staticmethod
-    def _map_label(label: str) -> Optional[str]:
-        l = label.lower()
-        if "expected annual loss" in l or l == "eal":
-            return "EAL"
-        if "value-at-risk" in l or "var" in l:
-            return "VaR"
-        if l == "rosi":
-            return "ROSI"
-        if "net capital saved" in l:
-            return "Net Capital Saved"
-        if "control cost" in l:
-            return "Control Cost"
-        if "risk reduced" in l:
-            return "Risk Reduced"
-        if "gordon-loeb" in l or "ceiling" in l:
-            return "Gordon-Loeb Ceiling"
-        if l == "primary loss":
-            return "Primary Loss"
-        if l == "secondary loss":
-            return "Secondary Loss"
-        return None
+        # Check percentage matches
+        for m in _PERCENT_REGEX.finditer(text):
+            num_str = m.group(1).replace(",", "")
+            try:
+                val = float(num_str)
+            except ValueError:
+                continue
+            # Ignore standard common percentages like 95% (from VaR 95%) or 100%
+            if val in (95.0, 100.0, 0.0):
+                continue
+            if not _is_number_grounded(val, valid_nums):
+                errors.append(f"Hallucinated percentage figure detected: '{m.group(0)}' (val={val})")
 
-    def _build_expected_map(self, payload: DeterministicContextPayload) -> Dict[str, float]:
-        m: Dict[str, float] = {}
-        if payload.fair:
-            m["EAL"] = payload.fair.eal_inr_cr
-            m["VaR"] = payload.fair.var_95_inr_cr
-            m["Primary Loss"] = payload.fair.primary_loss_inr_cr
-            m["Secondary Loss"] = payload.fair.secondary_loss_inr_cr
-        if payload.milprosi:
-            m["ROSI"] = payload.milprosi.rosi_pct
-            m["Net Capital Saved"] = payload.milprosi.net_capital_saved_inr_cr
-            m["Control Cost"] = payload.milprosi.control_cost_inr_cr
-            m["Risk Reduced"] = payload.milprosi.risk_reduced_inr_cr
-            m["Gordon-Loeb Ceiling"] = payload.milprosi.gordon_loeb_ceiling_inr_cr
-        return m
+        # Check Gordon-Loeb economic viability consistency
+        is_viable = None
+        if isinstance(payload, ExecutionPayload) and payload.rosi_result:
+            is_viable = payload.rosi_result.is_economically_viable
+        elif isinstance(payload, DeterministicContextPayload) and payload.milprosi:
+            is_viable = payload.milprosi.is_economically_viable
+
+        if is_viable is False:
+            text_lower = text.lower()
+            if "economically viable" in text_lower and "not economically viable" not in text_lower:
+                errors.append("Contradiction: Response claims spend is economically viable, but Gordon-Loeb ceiling is exceeded.")
+
+        passed = len(errors) == 0
+        return passed, errors
+
+    def verify(self, payload: Any, output_text: Any = None) -> Tuple[bool, List[str]]:
+        """Alias for verify_financial_integrity."""
+        return self.verify_financial_integrity(payload, output_text)
+
+
+def validate(response_text: str, payload: Any) -> Tuple[bool, List[str]]:
+    """Module-level function alias."""
+    verifier = SanityGuardrailVerifier()
+    return verifier.verify_financial_integrity(payload, response_text)

@@ -2,12 +2,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from api_layer.dual_routes import router
 
-
 app = FastAPI(
-    title="Dual-Persona AI Decision Assistant & Cyber Risk Quantification Platform",
+    title="CyberRiskIQ Gateway",
+    description="Cyber Risk Quantification & Synthesis Gateway",
     version="1.0.0",
 )
 
+# Permissive CORS middleware for frontend communication
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,12 +17,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Register router with /api/v1 prefix and also directly
 app.include_router(router, prefix="/api/v1", tags=["chat"])
+app.include_router(router, tags=["chat"])
 
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok"}
+    return {"status": "ok", "service": "CyberRiskIQ Gateway"}
 
 
 if __name__ == "__main__":
