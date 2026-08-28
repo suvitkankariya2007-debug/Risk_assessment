@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RiskLens — Cyber Risk Command Center</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">R</div>
+        <div>
+          <div class="brand-name">RiskLens</div>
+          <div class="brand-sub">Cyber Risk Intelligence</div>
+        </div>
+      </div>
+
+      <nav>
+        <button class="nav-item active" data-view="overview"><span>⌂</span> Overview</button>
+        <button class="nav-item" data-view="risks"><span>◈</span> Risk Explorer</button>
+        <button class="nav-item" data-view="whatif"><span>↗</span> What-if Simulator</button>
+        <button class="nav-item" data-view="investment"><span>₹</span> Investment</button>
+      </nav>
+
+      <div class="sidebar-bottom">
+        <div class="sync-card">
+          <div class="sync-title"><span class="live-dot"></span> Data feeds healthy</div>
+          <div class="sync-text">6 simulated sources · updated continuously</div>
+        </div>
+        <div class="prototype-label">PROTOTYPE · SYNTHETIC DATA</div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <div class="eyebrow">EXECUTIVE RISK VIEW</div>
+          <h1 id="page-title">Cyber Risk Command Center</h1>
+        </div>
+        <div class="top-actions">
+          <div class="last-sync">Last sync <strong>just now</strong></div>
+          <div class="avatar">PH</div>
+        </div>
+      </header>
+
+      <section id="overview" class="view active-view">
+        <div class="hero-grid">
+          <div class="hero-card">
+            <div class="card-label">Current Financial Exposure</div>
+            <div class="hero-value" id="ealValue">₹42.5 Cr</div>
+            <div class="hero-meta"><span class="risk-up">↑ 8.4%</span> vs. previous assessment</div>
+            <button class="trace-btn" id="openTrace">Why this number?</button>
+          </div>
+          <div class="metric-card">
+            <div class="card-label">Risk Confidence</div>
+            <div class="metric-value">78%</div>
+            <div class="confidence-bar"><span style="width:78%"></span></div>
+            <div class="muted">Based on source quality & coverage</div>
+          </div>
+          <div class="metric-card">
+            <div class="card-label">Value-at-Risk</div>
+            <div class="metric-value">₹68.2 Cr</div>
+            <div class="muted">95th percentile annual loss</div>
+          </div>
+          <div class="metric-card">
+            <div class="card-label">Immediate Actions</div>
+            <div class="metric-value">5</div>
+            <div class="muted">2 critical · 3 high priority</div>
+          </div>
+        </div>
+
+        <div class="section-grid">
+          <div class="panel chart-panel">
+            <div class="panel-head">
+              <div>
+                <div class="panel-title">Financial Risk Trend</div>
+                <div class="panel-sub">Estimated Annual Loss over the last 30 days</div>
+              </div>
+              <span class="pill">₹ Crore</span>
+            </div>
+            <div class="chart-wrap">
+              <svg viewBox="0 0 760 250" preserveAspectRatio="none" class="line-chart">
+                <line x1="35" y1="215" x2="740" y2="215" class="gridline"/>
+                <line x1="35" y1="155" x2="740" y2="155" class="gridline"/>
+                <line x1="35" y1="95" x2="740" y2="95" class="gridline"/>
+                <line x1="35" y1="35" x2="740" y2="35" class="gridline"/>
+                <polyline points="35,188 95,180 155,190 215,165 275,170 335,145 395,153 455,126 515,138 575,108 635,112 695,72 740,62" class="risk-line"/>
+                <circle cx="740" cy="62" r="5" class="risk-point"/>
+              </svg>
+              <div class="chart-labels"><span>30d ago</span><span>15d</span><span>Today</span></div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <div class="panel-title">Top Risk Contributors</div>
+                <div class="panel-sub">Ranked by estimated financial exposure</div>
+              </div>
+            </div>
+            <div class="risk-list">
+              <button class="risk-row" data-risk="payment">
+                <div class="rank">01</div>
+                <div class="risk-main"><strong>Payment Processing Server</strong><span>Internet-facing · active exploitation</span></div>
+                <div class="risk-amount">₹18.4 Cr</div>
+              </button>
+              <button class="risk-row" data-risk="customer">
+                <div class="rank">02</div>
+                <div class="risk-main"><strong>Customer Database</strong><span>Critical data · access control gap</span></div>
+                <div class="risk-amount">₹12.1 Cr</div>
+              </button>
+              <button class="risk-row" data-risk="cloud">
+                <div class="rank">03</div>
+                <div class="risk-main"><strong>Cloud API Gateway</strong><span>Misconfiguration · high exposure</span></div>
+                <div class="risk-amount">₹7.8 Cr</div>
+              </button>
+              <button class="risk-row" data-risk="identity">
+                <div class="rank">04</div>
+                <div class="risk-main"><strong>Privileged Identity Layer</strong><span>MFA coverage below target</span></div>
+                <div class="risk-amount">₹4.2 Cr</div>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">Risk Reduction Opportunities</div>
+              <div class="panel-sub">Actions ranked by estimated risk reduction per rupee</div>
+            </div>
+            <button class="ghost-btn" data-go="investment">View investment plan →</button>
+          </div>
+          <div class="opportunity-grid">
+            <div class="opportunity">
+              <div class="opp-top"><span class="severity critical">CRITICAL</span><span>₹15L</span></div>
+              <strong>Patch payment server</strong>
+              <div class="opp-detail">Estimated risk reduction <b>₹7.4 Cr</b></div>
+            </div>
+            <div class="opportunity">
+              <div class="opp-top"><span class="severity high">HIGH</span><span>₹20L</span></div>
+              <strong>Increase Multi-Factor Authentication coverage</strong>
+              <div class="opp-detail">Estimated risk reduction <b>₹4.1 Cr</b></div>
+            </div>
+            <div class="opportunity">
+              <div class="opp-top"><span class="severity high">HIGH</span><span>₹40L</span></div>
+              <strong>Segment critical network</strong>
+              <div class="opp-detail">Estimated risk reduction <b>₹6.8 Cr</b></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="risks" class="view">
+        <div class="page-intro">
+          <div><div class="eyebrow">TRACEABILITY</div><h2>Risk Explorer</h2><p>See the evidence behind each financial risk estimate.</p></div>
+        </div>
+        <div class="risk-explorer-grid">
+          <div class="panel">
+            <div class="panel-head"><div class="panel-title">Risk Contributors</div><span class="pill">4 assets</span></div>
+            <div class="risk-list large">
+              <button class="risk-row selected" data-risk="payment"><div class="rank">01</div><div class="risk-main"><strong>Payment Processing Server</strong><span>₹18.4 Cr exposure</span></div><span class="arrow">→</span></button>
+              <button class="risk-row" data-risk="customer"><div class="rank">02</div><div class="risk-main"><strong>Customer Database</strong><span>₹12.1 Cr exposure</span></div><span class="arrow">→</span></button>
+              <button class="risk-row" data-risk="cloud"><div class="rank">03</div><div class="risk-main"><strong>Cloud API Gateway</strong><span>₹7.8 Cr exposure</span></div><span class="arrow">→</span></button>
+              <button class="risk-row" data-risk="identity"><div class="rank">04</div><div class="risk-main"><strong>Privileged Identity Layer</strong><span>₹4.2 Cr exposure</span></div><span class="arrow">→</span></button>
+            </div>
+          </div>
+          <div class="panel trace-panel" id="tracePanel"></div>
+        </div>
+      </section>
+
+      <section id="whatif" class="view">
+        <div class="page-intro">
+          <div><div class="eyebrow">DECISION SUPPORT</div><h2>What-if Simulator</h2><p>Test a business decision before you make it.</p></div>
+        </div>
+        <div class="sim-grid">
+          <div class="panel simulator">
+            <div class="panel-title">Scenario</div>
+            <label>What happens if we delay the payment-server patch?</label>
+            <div class="scenario-box">
+              <select id="scenarioSelect">
+                <option value="patch">Delay payment-server patch</option>
+                <option value="mfa">Reduce Multi-Factor Authentication coverage</option>
+                <option value="segment">Delay network segmentation</option>
+              </select>
+            </div>
+            <label class="range-label">Delay duration <strong id="daysLabel">90 days</strong></label>
+            <input type="range" id="daysRange" min="30" max="180" value="90" step="30">
+            <div class="range-scale"><span>30 days</span><span>180 days</span></div>
+            <button class="primary-btn" id="simulateBtn">Run simulation</button>
+          </div>
+          <div class="panel simulation-result">
+            <div class="panel-title">Projected Impact</div>
+            <div class="result-grid">
+              <div><span>Current exposure</span><strong>₹42.5 Cr</strong></div>
+              <div><span>Projected exposure</span><strong id="projected">₹58.7 Cr</strong></div>
+              <div><span>Additional exposure</span><strong class="danger" id="additional">+₹16.2 Cr</strong></div>
+            </div>
+            <div class="impact-bar"><span id="impactFill"></span></div>
+            <div class="recommendation">
+              <span class="recommendation-icon">!</span>
+              <div><strong id="recommendationTitle">Recommendation: patch within 14 days</strong><p id="recommendationText">The simulated delay materially increases the expected financial exposure of the payment system.</p></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="investment" class="view">
+        <div class="page-intro">
+          <div><div class="eyebrow">OPTIMIZATION</div><h2>Investment Plan</h2><p>Maximize estimated risk reduction within a fixed budget.</p></div>
+          <div class="budget-box">Budget <strong>₹1.00 Cr</strong></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><div class="panel-title">Recommended Control Portfolio</div><span class="pill success-pill">₹18.3 Cr estimated risk reduction</span></div>
+          <div class="investment-table">
+            <div class="table-row table-head"><span>Control</span><span>Cost</span><span>Risk reduction</span><span>Priority</span></div>
+            <div class="table-row"><span><strong>Patch payment server</strong><small>Removes critical exposure</small></span><span>₹15L</span><span>₹7.4 Cr</span><span class="severity critical">CRITICAL</span></div>
+            <div class="table-row"><span><strong>Network segmentation</strong><small>Limits attack spread</small></span><span>₹40L</span><span>₹6.8 Cr</span><span class="severity high">HIGH</span></div>
+            <div class="table-row"><span><strong>Increase Multi-Factor Authentication</strong><small>Protects privileged access</small></span><span>₹20L</span><span>₹4.1 Cr</span><span class="severity high">HIGH</span></div>
+            <div class="table-row"><span><strong>Monitoring upgrade</strong><small>Improves detection coverage</small></span><span>₹20L</span><span>₹0.9 Cr</span><span class="severity medium">MEDIUM</span></div>
+          </div>
+        </div>
+        <div class="section-grid">
+          <div class="panel">
+            <div class="panel-title">Why this portfolio?</div>
+            <ul class="explain-list">
+              <li>Highest estimated financial risk reduction per rupee.</li>
+              <li>Prioritizes the internet-facing payment asset.</li>
+              <li>Stays within the ₹1 crore budget constraint.</li>
+              <li>Balances immediate remediation with attack-spread reduction.</li>
+            </ul>
+          </div>
+          <div class="panel">
+            <div class="panel-title">Investment effect</div>
+            <div class="big-reduction">₹42.5 Cr <span>→</span> ₹24.2 Cr</div>
+            <div class="muted">Illustrative post-control exposure</div>
+            <div class="confidence-bar"><span style="width:72%"></span></div>
+            <div class="muted">Estimated residual-risk confidence: 72%</div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="modal-backdrop" id="traceModal">
+    <div class="modal">
+      <button class="close-btn" id="closeModal">×</button>
+      <div class="eyebrow">TRACEABILITY</div>
+      <h2>Why is the financial exposure ₹42.5 Cr?</h2>
+      <p class="modal-sub">The prototype connects the estimate to evidence from six data categories. Values below are synthetic demo data.</p>
+      <div class="trace-grid">
+        <div class="trace-card"><span>Vulnerability Scanner</span><strong>CVE severity 9.8</strong><small>1 critical unpatched weakness</small></div>
+        <div class="trace-card"><span>Security Monitoring</span><strong>High attack activity</strong><small>23 suspicious connections</small></div>
+        <div class="trace-card"><span>Asset Inventory</span><strong>Critical asset</strong><small>Payment processing server</small></div>
+        <div class="trace-card"><span>Cloud Platform</span><strong>Internet exposed</strong><small>Production environment</small></div>
+        <div class="trace-card"><span>Identity System</span><strong>16 / 18 MFA protected</strong><small>Privileged access gap detected</small></div>
+        <div class="trace-card"><span>Business Data</span><strong>₹15L / hour</strong><small>Estimated downtime impact</small></div>
+      </div>
+      <div class="confidence-box"><div><strong>Data confidence</strong><span>78%</span></div><div class="confidence-bar"><span style="width:78%"></span></div><small>Confidence reflects completeness and consistency of the synthetic inputs.</small></div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
