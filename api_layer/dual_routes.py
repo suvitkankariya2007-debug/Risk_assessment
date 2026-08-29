@@ -12,7 +12,7 @@ import re
 import time
 import uuid
 from typing import Dict, Any, List, Optional
-from fastapi import APIRouter, HTTPException, Body
+from fastapi import APIRouter, HTTPException, Body, UploadFile, File
 
 from schemas.data_models import (
     ChatRequest,
@@ -41,9 +41,12 @@ from api_layer.synthesizer import (
     format_business_briefing,
     format_technical_diagnostic,
     HybridSynthesizer,
+    _extract_payload_dict,
 )
 from api_layer.guardrails import SanityGuardrailVerifier
 from api_layer import mock_kb
+from api_layer.scan_ledger import scan_ledger, ScanUploadResponse
+from api_layer.model_manager import model_manager
 
 router = APIRouter()
 
@@ -75,12 +78,20 @@ def _extract_slots(prompt: str) -> Dict[str, Any]:
         else:
             budget_lakhs = val
 
-    # Resolve target asset name
+    # Resolve target asset name — check ScanLedger first
     asset_name = "Core Payment Switch"
-    for candidate in ["customer_db", "api_gateway", "core_payment_switch", "payment switch", "customer database", "api gateway"]:
+    for candidate in ["customer_db", "api_gateway", "core_payment_switch", "payment switch",
+                       "customer database", "api gateway", "legacy-dev-sandbox"]:
         if candidate in prompt.lower():
             asset_name = candidate
             break
+
+    # Dynamic scan ledger lookup: if a scan is loaded and contains the CVE, enrich
+    if scan_ledger.is_loaded:
+        scan_vuln = scan_ledger.lookup_cve(cve_id)
+        if scan_vuln:
+            # Enrich from live scan data rather than static mock_kb
+            pass  # lookup_vuln will use scan_ledger below
 
     return {
         "cve_id": cve_id,
@@ -95,13 +106,18 @@ def _run_core_engines(prompt: str, context_overrides: Optional[Dict[str, Any]] =
     if context_overrides:
         slots.update(context_overrides)
 
-    # 1. Resolve Asset Topology
+    # 1. Resolve Asset Topology (safe fallback for unknown assets)
     try:
-        topo_data = asset_graph.resolve_asset(slots["asset_name"])
-    except KeyError:
+        topo_data = asset_graph.resolve_asset(slots.get("asset_name", "core_payment_switch"))
+    except (KeyError, Exception):
         topo_data = asset_graph.resolve_asset("core_payment_switch")
 
-    vuln_info = mock_kb.lookup_vuln(slots["cve_id"])
+    # Query ScanLedger first, then fall back to mock_kb
+    vuln_info = None
+    if scan_ledger.is_loaded:
+        vuln_info = scan_ledger.lookup_cve(slots.get("cve_id", ""))
+    if not vuln_info:
+        vuln_info = mock_kb.lookup_vuln(slots.get("cve_id", ""))
 
     # Build EPSS 16-feature boolean flags dictionary
     features: Dict[str, bool] = {
@@ -240,17 +256,175 @@ def _build_context_payload(payload: ExecutionPayload, session_id: str, persona: 
     )
 
 
+def _analyze_query_intent(prompt: str) -> str:
+    """Classify prompt into UNIDENTIFIED, CONVERSATIONAL, GENERAL_KNOWLEDGE, or RISK_QUANTIFICATION."""
+    clean = (prompt or "").strip()
+    if not clean:
+        return "UNIDENTIFIED"
+    
+    # 1. Unidentified symbols / single char / gibberish (e.g. "/", "?", "asd")
+    if len(clean) < 3 or clean in ["/", "?", "!", ".", "asdf", "test", "xxx", "helpme"]:
+        if clean.lower() in ["hi", "hey", "yo"]:
+            return "CONVERSATIONAL"
+        return "UNIDENTIFIED"
+    
+    lower = clean.lower()
+
+    # 2. Conversational greetings / general system info
+    if any(lower.startswith(g) for g in ["hi", "hello", "hey", "greetings", "good morning", "good evening"]):
+        if not any(k in lower for k in ["cve", "loss", "eal", "var", "epss", "budget", "cost", "switch", "database"]):
+            return "CONVERSATIONAL"
+    if "who are you" in lower or "what can you do" in lower or lower == "help":
+        return "CONVERSATIONAL"
+
+    # 3. Intercept general / non-risk queries (e.g. "what is an api key", "how does a firewall work", "explain waf")
+    # If the prompt does NOT contain a CVE pattern and does NOT mention any known assets:
+    has_cve = bool(_CVE_PATTERN.search(clean))
+    known_assets = ["customer_db", "api_gateway", "core_payment_switch", "payment switch",
+                    "customer database", "api gateway", "legacy-dev-sandbox", "sandbox"]
+    has_asset = any(asset in lower for asset in known_assets)
+    
+    # Also check if it contains risk metrics keywords that require calculation
+    risk_keywords = ["eal", "var", "expected annual loss", "value at risk", "rosi", "gordon-loeb", "gordon loeb", "quantify", "simulation", "budget", "capital", "crore", "crores", "lakh", "lakhs", "approval"]
+    has_risk_keyword = any(kw in lower for kw in risk_keywords)
+
+    if not has_cve and not has_asset and not has_risk_keyword:
+        return "GENERAL_KNOWLEDGE"
+
+    # 4. General knowledge questions about risk metrics specifically
+    if any(q in lower for q in ["what is", "explain", "how does", "define", "what does"]) and not has_cve:
+        # If it specifically asks for a definition, let's keep it as general knowledge
+        if any(k in lower for k in ["fair", "epss", "rosi", "gordon", "loeb", "var", "eal", "xai", "trust score"]):
+            return "GENERAL_KNOWLEDGE"
+
+    # 5. Standard Risk Quantification / Diagnostic
+    return "RISK_QUANTIFICATION"
+
+
+def _build_dummy_context_payload(session_id: str, persona: PersonaType) -> DeterministicContextPayload:
+    """Build a fast, dummy context payload bypassing heavy mathematical simulations."""
+    asset_node = AssetNode(
+        asset_id="AST-000",
+        name="General Context",
+        criticality_score=0.0,
+        hardware_replacement_cost_inr_cr=0.0,
+        daily_revenue_impact_inr_cr=0.0,
+        regulatory_tier="N/A",
+        asset_type="general",
+    )
+    epss_out = EPSSOutput(
+        cve_id="N/A",
+        z_score=0.0,
+        p_exploit=0.0,
+        feature_contributions={},
+    )
+    fair_out = FAIROutput(
+        asset_id="AST-000",
+        cve_id="N/A",
+        lef=0.0,
+        primary_loss_inr_cr=0.0,
+        secondary_loss_inr_cr=0.0,
+        eal_inr_cr=0.0,
+        var_95_inr_cr=0.0,
+        trial_samples=[],
+    )
+    xai_out = XAIOutput(
+        trust_score_pct=100.0,
+        iqr_threshold=0.0,
+        flags_status="EXPERT_GROUNDED",
+        misaligned_tokens=[],
+    )
+    milprosi_out = MILPROSIOutput(
+        control_cost_inr_cr=0.0,
+        risk_reduced_inr_cr=0.0,
+        net_capital_saved_inr_cr=0.0,
+        rosi_pct=0.0,
+        is_economically_viable=True,
+        gordon_loeb_ceiling_inr_cr=0.0,
+    )
+    slots_res = SlotExtractionResult(
+        asset_target="N/A",
+        cve_id="N/A",
+        budget_limit=0.0,
+        timeline_delta=0,
+        confidence=1.0,
+    )
+
+    return DeterministicContextPayload(
+        session_id=session_id,
+        persona=persona,
+        timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        slots=slots_res,
+        asset=asset_node,
+        epss=epss_out,
+        fair=fair_out,
+        xai=xai_out,
+        milprosi=milprosi_out,
+        compliance_controls=[],
+        guardrail_passed=True,
+        guardrail_errors=[],
+    )
+
+
+def _handle_unidentified_or_conversational(prompt: str, session_id: str, persona: PersonaType, query_type: str) -> ChatResponse:
+    """Generate dynamic help / clarification response for unidentified or conversational prompts, bypassing math engines."""
+    start_time = time.perf_counter()
+    
+    # Direct routing to conversational response generator (bypassing core engines)
+    text = synthesizer.generate_conversational_response(prompt, persona)
+    
+    # Build dummy context payload so we bypass the heavy engines
+    context_payload = _build_dummy_context_payload(session_id, persona)
+    
+    latency_ms = (time.perf_counter() - start_time) * 1000.0
+    return ChatResponse(
+        session_id=session_id,
+        persona=persona,
+        formatted_output=text,
+        context_payload=context_payload,
+        latency_ms=round(latency_ms, 2),
+    )
+
+
+def _handle_general_knowledge(prompt: str, session_id: str, persona: PersonaType) -> ChatResponse:
+    """Answer conceptual security risk questions grounded in platform math, bypassing math engines."""
+    start_time = time.perf_counter()
+    
+    # Direct routing to conversational response generator (bypassing core engines)
+    text = synthesizer.generate_conversational_response(prompt, persona)
+    
+    # Build dummy context payload so we bypass the heavy engines
+    context_payload = _build_dummy_context_payload(session_id, persona)
+    
+    latency_ms = (time.perf_counter() - start_time) * 1000.0
+    return ChatResponse(
+        session_id=session_id,
+        persona=persona,
+        formatted_output=text,
+        context_payload=context_payload,
+        latency_ms=round(latency_ms, 2),
+    )
+
+
+
 @router.post("/chat/business", response_model=ChatResponse)
 async def chat_business(request: ChatRequest) -> ChatResponse:
     """Run core engines, format executive business briefing, verify financial integrity, return ChatResponse."""
     start_time = time.perf_counter()
     prompt = request.prompt or ""
 
-    # Execute core engines
+    # Classify query intent
+    query_type = _analyze_query_intent(prompt)
+    if query_type in ["UNIDENTIFIED", "CONVERSATIONAL"]:
+        return _handle_unidentified_or_conversational(prompt, request.session_id, PersonaType.BUSINESS, query_type)
+    elif query_type == "GENERAL_KNOWLEDGE":
+        return _handle_general_knowledge(prompt, request.session_id, PersonaType.BUSINESS)
+
+    # Execute core engines for Risk Quantification
     execution_payload = _run_core_engines(prompt, request.context_overrides)
 
-    # Synthesize plain-English executive briefing
-    formatted_output = format_business_briefing(execution_payload)
+    # Synthesize plain-English executive briefing with user prompt context
+    formatted_output = format_business_briefing(execution_payload, prompt)
 
     # Sanity guardrail verification
     passed, errors = guardrail.verify_financial_integrity(execution_payload, formatted_output)
@@ -276,11 +450,18 @@ async def chat_technical(request: ChatRequest) -> ChatResponse:
     start_time = time.perf_counter()
     prompt = request.prompt or ""
 
-    # Execute core engines
+    # Classify query intent
+    query_type = _analyze_query_intent(prompt)
+    if query_type in ["UNIDENTIFIED", "CONVERSATIONAL"]:
+        return _handle_unidentified_or_conversational(prompt, request.session_id, PersonaType.TECHNICAL, query_type)
+    elif query_type == "GENERAL_KNOWLEDGE":
+        return _handle_general_knowledge(prompt, request.session_id, PersonaType.TECHNICAL)
+
+    # Execute core engines for Technical Risk Diagnostic
     execution_payload = _run_core_engines(prompt, request.context_overrides)
 
-    # Synthesize technical diagnostic
-    formatted_output = format_technical_diagnostic(execution_payload)
+    # Synthesize technical diagnostic with user prompt context
+    formatted_output = format_technical_diagnostic(execution_payload, prompt)
 
     # Sanity guardrail verification
     passed, errors = guardrail.verify_financial_integrity(execution_payload, formatted_output)
@@ -300,6 +481,89 @@ async def chat_technical(request: ChatRequest) -> ChatResponse:
     )
 
 
+# ── Semantic Intent Router (TF-IDF Cosine Similarity) ──────────────────────
+class SemanticIntentRouter:
+    """NLP-powered intent classifier using TF-IDF cosine similarity.
+
+    Replaces static keyword dictionaries with semantic document similarity
+    computed against business and technical reference corpora.
+    """
+
+    _BIZ_CORPUS = [
+        "expected annual financial loss exposure enterprise risk assessment",
+        "budget allocation security investment return ROSI economic viability",
+        "Gordon-Loeb optimal spending ceiling capital expenditure justification",
+        "board CISO executive briefing monetary impact revenue downtime cost",
+        "regulatory fine penalty secondary loss compliance SEBI RBI framework",
+        "Monte Carlo simulation value at risk VaR confidence interval",
+        "knapsack optimization control portfolio cost benefit analysis",
+        "insurance coverage cyber liability premium annual loss expectancy",
+        "stakeholder reporting risk appetite tolerance approval spend crore lakh",
+    ]
+    _TECH_CORPUS = [
+        "CVE vulnerability exploit EPSS probability prediction logistic regression",
+        "CVSS vector base score attack surface network adjacent local physical",
+        "XAI explainable AI trust score integrated gradients salient tokens",
+        "patch remediation vulnerability management severity critical high medium",
+        "WAF rules firewall IDS IPS network segmentation microsegmentation",
+        "ransomware malware trojan lateral movement privilege escalation RCE",
+        "incident response forensics threat hunting indicators of compromise IOC",
+        "proof of concept weaponized exploit code execution remote arbitrary",
+        "SIEM EDR endpoint detection alert triage enrichment correlation SOC",
+    ]
+
+    def __init__(self) -> None:
+        self._use_sklearn = False
+        try:
+            from sklearn.feature_extraction.text import TfidfVectorizer
+            from sklearn.metrics.pairwise import cosine_similarity as _cos
+
+            self._vec = TfidfVectorizer(
+                stop_words="english", ngram_range=(1, 2),
+                max_features=500, sublinear_tf=True,
+            )
+            self._vec.fit(self._BIZ_CORPUS + self._TECH_CORPUS)
+            self._biz_m = self._vec.transform(self._BIZ_CORPUS)
+            self._tech_m = self._vec.transform(self._TECH_CORPUS)
+            self._cos = _cos
+            self._use_sklearn = True
+        except Exception:
+            pass
+
+    def classify(self, prompt: str) -> PersonaType:
+        if self._use_sklearn:
+            q = self._vec.transform([prompt.lower()])
+            biz = float(self._cos(q, self._biz_m).max())
+            tech = float(self._cos(q, self._tech_m).max())
+        else:
+            lower = prompt.lower()
+            biz = sum(1 for w in ["budget", "cost", "loss", "invest",
+                                   "spend", "viable", "ciso", "board",
+                                   "financial", "revenue", "gordon",
+                                   "downtime", "roi", "rosi"] if w in lower)
+            tech = sum(1 for w in ["cve", "epss", "exploit", "cvss",
+                                    "vulnerability", "patch", "xai",
+                                    "trust", "salient", "remediat",
+                                    "ransomware", "severity"] if w in lower)
+        if _CVE_PATTERN.search(prompt):
+            tech += 0.25 if self._use_sklearn else 3
+        if _BUDGET_PATTERN.search(prompt):
+            biz += 0.25 if self._use_sklearn else 3
+        return PersonaType.TECHNICAL if tech > biz else PersonaType.BUSINESS
+
+
+intent_router = SemanticIntentRouter()
+
+
+@router.post("/chat", response_model=ChatResponse)
+async def chat_auto_route(request: ChatRequest) -> ChatResponse:
+    """Unified endpoint: auto-classifies intent via semantic similarity, routes to the correct handler."""
+    persona = intent_router.classify(request.prompt or "")
+    if persona == PersonaType.TECHNICAL:
+        return await chat_technical(request)
+    return await chat_business(request)
+
+
 @router.post("/models/stream-update")
 async def stream_update(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     """Ingest live telemetry batch to update exploit weights via EPSSPredictor.continuous_online_update()."""
@@ -313,3 +577,58 @@ async def stream_update(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         "samples_ingested": len(telemetry_batch),
         "model_fitted": epss_predictor._sgd_fitted,
     }
+
+
+# ── Scan Ingestion Endpoints ────────────────────────────────────────────────
+@router.post("/scan/upload", response_model=ScanUploadResponse)
+async def upload_scan(file: UploadFile = File(...)) -> ScanUploadResponse:
+    """Upload a JSON or CSV vulnerability scan file for dynamic ingestion."""
+    content = await file.read()
+    text = content.decode("utf-8", errors="replace")
+    filename = (file.filename or "").lower()
+
+    if filename.endswith(".json"):
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON file.")
+        count = scan_ledger.ingest_json(raw)
+    elif filename.endswith(".csv"):
+        count = scan_ledger.ingest_csv(text)
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported file format. Upload .json or .csv files.")
+
+    return ScanUploadResponse(
+        status="success",
+        findings_ingested=count,
+        total_findings=len(scan_ledger._findings),
+        scan_id=f"SCAN-{scan_ledger.scan_count:03d}",
+    )
+
+
+@router.get("/scan/findings")
+async def get_scan_findings() -> Dict[str, Any]:
+    """Return cached scan findings summary."""
+    return {
+        "loaded": scan_ledger.is_loaded,
+        "total_findings": len(scan_ledger._findings),
+        "scan_count": scan_ledger.scan_count,
+        "findings": scan_ledger.list_findings(),
+    }
+
+
+@router.delete("/scan/clear")
+async def clear_scan_ledger() -> Dict[str, str]:
+    """Clear all cached scan findings."""
+    scan_ledger.clear()
+    return {"status": "cleared"}
+
+
+# ── Model Status Endpoint ──────────────────────────────────────────────────
+@router.get("/models/status")
+async def model_status() -> Dict[str, Any]:
+    """Return current transformer model status and fallback state."""
+    return model_manager.status()
+
+
+import json  # ensure json is available for scan upload

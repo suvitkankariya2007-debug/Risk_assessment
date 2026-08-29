@@ -23,6 +23,15 @@ def _collect_payload_numbers(payload: Any) -> Set[float]:
     nums: Set[float] = set()
 
     if isinstance(payload, ExecutionPayload):
+        if payload.threat_context:
+            nums.add(round(payload.threat_context.asset_replacement_cost_cr, 2))
+            nums.add(round(payload.threat_context.daily_revenue_impact_cr, 2))
+            nums.add(round(payload.threat_context.cvss_base_score, 1))
+            nums.add(round(payload.threat_context.proposed_control_cost_lakhs, 2))
+            # Proposed control cost in Crore
+            nums.add(round(payload.threat_context.proposed_control_cost_lakhs / 100.0, 2))
+            # Proposed control cost in Lakhs
+            nums.add(round(payload.threat_context.proposed_control_cost_lakhs, 1))
         if payload.fair_result:
             nums.add(round(payload.fair_result.expected_annual_loss_cr, 2))
             nums.add(round(payload.fair_result.value_at_risk_95_cr, 2))
@@ -48,6 +57,10 @@ def _collect_payload_numbers(payload: Any) -> Set[float]:
             nums.add(round(payload.rosi_result.gordon_loeb_cap_cr, 4))
 
     elif isinstance(payload, DeterministicContextPayload):
+        if payload.asset:
+            nums.add(round(payload.asset.hardware_replacement_cost_inr_cr, 2))
+            nums.add(round(payload.asset.daily_revenue_impact_inr_cr, 2))
+            nums.add(round(payload.asset.criticality_score, 1))
         if payload.fair:
             nums.add(round(payload.fair.eal_inr_cr, 2))
             nums.add(round(payload.fair.var_95_inr_cr, 2))

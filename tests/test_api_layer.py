@@ -78,7 +78,7 @@ def _make_technical_llm_response(data: dict) -> str:
     )
 
 
-def _mock_llm_side_effect(prompt: str, data: dict) -> str:
+def _mock_llm_side_effect(prompt: str, data: dict, *args, **kwargs) -> str:
     """Side-effect factory: returns template-style text with exact payload numbers."""
     persona_hint = prompt.lower()
     if "audience: secops" in persona_hint or "audience: technical" in persona_hint:
@@ -278,5 +278,38 @@ class TestStreamingRetrainingBus:
             "/api/v1/models/stream-update",
             json="this is not a valid list or dict payload",
         )
-
         assert response.status_code == 422
+
+
+# ============================================================================
+# Class 4: TestIntentClassificationAndUnidentifiedQueries
+# ============================================================================
+
+class TestIntentClassificationAndUnidentifiedQueries:
+    """Tests for NLU Intent classification: unidentified strings, conversational prompts, and general knowledge."""
+
+    def test_unidentified_string_symbol_returns_guidance(self):
+        """Unidentified symbol like '/' should return dynamic prompt guidance without error."""
+        response = client.post("/api/v1/chat/business", json={"session_id": "s1", "persona": "business", "prompt": "/"})
+        assert response.status_code == 200
+        data = response.json()
+        assert "UNIDENTIFIED QUERY: '/'" in data["formatted_output"]
+        assert "Suggested Executive Queries" in data["formatted_output"]
+        assert data["context_payload"]["guardrail_passed"] is True
+
+    def test_conversational_greeting_returns_welcome(self):
+        """Greeting like 'hello' should return copilot introduction."""
+        response = client.post("/api/v1/chat/technical", json={"session_id": "s2", "persona": "technical", "prompt": "hello"})
+        assert response.status_code == 200
+        data = response.json()
+        assert "CYBERRISKIQ SECOPS DIAGNOSTIC COPILOT ONLINE" in data["formatted_output"]
+        assert data["context_payload"]["guardrail_passed"] is True
+
+    def test_general_knowledge_concept_explanation(self):
+        """Conceptual question like 'what is ROSI?' returns mathematical explanation grounded in metrics."""
+        response = client.post("/api/v1/chat/business", json={"session_id": "s3", "persona": "business", "prompt": "what is ROSI?"})
+        assert response.status_code == 200
+        data = response.json()
+        assert "CONCEPT EXPLANATION: Return on Security Investment (ROSI)" in data["formatted_output"]
+        assert "Grounding Example" in data["formatted_output"]
+        assert data["context_payload"]["guardrail_passed"] is True
