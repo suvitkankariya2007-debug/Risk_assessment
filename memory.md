@@ -3,7 +3,7 @@
 ## System Status
 - **Build State**: CLEAN & STABLE
 - **Directory Structure**: Strictly enforced. Untracked root files migrated into `api_layer/` and `core_engines/`.
-- **Test Suite Pass Rate**: 43/43 passing tests (`pytest tests/`).
+- **Test Suite Pass Rate**: 46/46 passing tests (`pytest tests/`).
 - **Deterministic Core**: Fully protected and frozen.
 
 ## Dynamic NLU & Unidentified Query Fixes (Troubleshooting Audit)
@@ -19,12 +19,15 @@
    - `UNIDENTIFIED`: Catches symbols (`/`, `?`), single characters, or random gibberish. Returns a helpful guidance response.
    - `CONVERSATIONAL`: Detects greetings (`hi`, `hello`, `help`, `who are you`). Returns persona-specific Copilot intro.
    - `GENERAL_KNOWLEDGE`: Detects conceptual risk questions (`what is ROSI?`, `explain EPSS`). Synthesizes educational explanations.
+   - `SCAN_ANALYSIS`: Expanded deterministic rules to identify vulnerability scan/upload/findings keywords, guaranteeing correct routing during API quota fallbacks.
    - `RISK_QUANTIFICATION`: Resolves slots dynamically, executes deterministic math engines, synthesizes prompt-tailored answers.
 2. **Context-Aware Dynamic Synthesizer (`synthesizer.py`)**: Accepts `prompt: str` for custom lead-in answers.
 3. **External LLM API hook**: `call_external_llm()` passes `user_prompt` alongside `PRE-CALCULATED EXECUTION_PAYLOAD`.
 4. **SanityGuardrailVerifier Numbers Collection Expanded**: Updated `_collect_payload_numbers` to extract asset replacement cost, daily revenue impact, and CVSS base scores.
 5. **Watchdog Refactoring**: Local transformer watchdog hot-swaps on error/hallucination, but external LLM response is returned to let the route's guardrail verify and flag it correctly.
 6. **Conversational Fallback Alignment**: Added exact fallback response checks for greetings, welcome messages, and unidentified symbols to match the test suite expectations.
+7. **Gemini Model Update**: Swapped deprecated `gemini-2.5-flash` model to the supported `gemini-3.6-flash` model in both NLU and Synthesizer modules to resolve new user API availability issues.
+8. **Intent Routing Hardening**: Consolidated conversational/unidentified/general knowledge paths to route through synthesizer's standard formatting templates to maintain exact testing assertions.
 
 ---
 
@@ -191,8 +194,8 @@ python -m http.server 3000
 ```bash
 cd /home/suvitk/sih
 source .venv/bin/activate
-pytest tests/ -v           # Run all 43 tests
+pytest tests/ -v           # Run all 46 tests
 pytest tests/test_engines.py -v           # Core engine tests (21)
 pytest tests/test_api_layer.py -v         # API integration tests (8)
-pytest tests/test_chatbot_edge_cases.py -v  # Edge-case stress tests (14)
+pytest tests/test_chatbot_edge_cases.py -v  # Edge-case stress tests (17)
 ```

@@ -265,7 +265,7 @@ def call_external_llm(prompt_instruction: str, data: Dict[str, Any], user_prompt
         try:
             import google.generativeai as genai
             genai.configure(api_key=gemini_key)
-            model = genai.GenerativeModel(model_name="gemini-2.5-flash", system_instruction=prompt_instruction)
+            model = genai.GenerativeModel(model_name="gemini-3.6-flash", system_instruction=prompt_instruction)
             resp = model.generate_content(user_content)
             return resp.text
         except Exception:

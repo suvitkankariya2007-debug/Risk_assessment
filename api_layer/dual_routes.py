@@ -8,11 +8,35 @@ Endpoints:
 - POST /api/v1/chat/technical
 - POST /api/v1/models/stream-update
 """
+import os
 import re
 import time
 import uuid
+import json
 from typing import Dict, Any, List, Optional
 from fastapi import APIRouter, HTTPException, Body, UploadFile, File
+
+# Helper to load .env manually
+def _load_env():
+    try:
+        # Check current dir and parent dir for .env
+        for path in [".env", "../.env", "../../.env"]:
+            if os.path.exists(path):
+                with open(path, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            parts = line.split("=", 1)
+                            if len(parts) == 2:
+                                k = parts[0].strip()
+                                v = parts[1].strip()
+                                if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                                    v = v[1:-1]
+                                os.environ[k] = v
+    except Exception:
+        pass
+
+_load_env()
 
 from schemas.data_models import (
     ChatRequest,
@@ -62,6 +86,186 @@ guardrail = SanityGuardrailVerifier()
 
 _CVE_PATTERN = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
 _BUDGET_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*(crores?|cr|lakhs?|l)\b", re.IGNORECASE)
+
+NLU_SYSTEM_PROMPT = """You are the NLU (Natural Language Understanding) parser for the CyberRiskIQ Copilot.
+Analyze the user's raw text prompt and extract structured intent and entity slots.
+
+Intents:
+1. RISK_QUANTIFICATION: The user is asking to calculate/evaluate risks, financial loss exposure, or budget viability for specific assets or CVEs (e.g. "What is the expected annual loss for customer_db?", "is a budget of 30 Lakhs viable for core payment switch?").
+2. SCAN_ANALYSIS: The user is asking about findings in the uploaded scan file, vulnerability reports, or uploaded scan analysis (e.g. "what are findings from uploaded file", "analyse the file", "list vulnerabilities in the scan").
+3. GENERAL_KNOWLEDGE: The user is asking for general, conceptual explanations of security risk metrics or standards (e.g. "explain ROSI", "what is EPSS?", "define FAIR model").
+4. CONVERSATIONAL: The query is a simple greeting, farewell, help request, or a generic word like "budget" or "risks" without any CVE or asset context (e.g. "hello", "hi", "who are you?", "budget", "what can you do?").
+5. UNIDENTIFIED: The prompt is gibberish, punctuation symbols, or completely unclear (e.g. "/", "?", "asdf").
+
+Assets:
+- customer_db
+- api_gateway
+- core_payment_switch
+- legacy-dev-sandbox
+
+You must output a single JSON object (and absolutely nothing else) with the following keys:
+{
+  "intent": "RISK_QUANTIFICATION" | "SCAN_ANALYSIS" | "GENERAL_KNOWLEDGE" | "CONVERSATIONAL" | "UNIDENTIFIED",
+  "cve_id": string or null,
+  "asset_name": "customer_db" | "api_gateway" | "core_payment_switch" | "legacy-dev-sandbox" | null,
+  "budget_lakhs": float or null,
+  "conversational_response": string or null
+}
+
+Rule for budget extraction:
+- Extract money and convert to Lakhs (1 Crore = 100 Lakhs, e.g. "₹50 Lakhs" -> 50.0, "3 Crores" -> 300.0, "500 Cr" -> 50000.0).
+
+Rule for conversational_response:
+- If intent is CONVERSATIONAL, GENERAL_KNOWLEDGE, or UNIDENTIFIED, provide a direct, high-quality, friendly conversational reply.
+- If the query is vague/incomplete (e.g. just the word "budget"), guide the user to specify an asset and budget value.
+
+Ensure the output is strictly valid JSON.
+"""
+
+def _call_llm_nlu(prompt: str) -> Optional[Dict[str, Any]]:
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    if gemini_key:
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=gemini_key)
+            model = genai.GenerativeModel(
+                model_name="gemini-3.6-flash",
+                generation_config={"response_mime_type": "application/json"},
+                system_instruction=NLU_SYSTEM_PROMPT
+            )
+            resp = model.generate_content(f"User Prompt: {prompt}")
+            if resp and resp.text:
+                return json.loads(resp.text.strip())
+        except Exception as e:
+            print(f"[NLU LLM] Gemini NLU call failed: {e}")
+            
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    if openai_key:
+        try:
+            import openai
+            client = openai.OpenAI(api_key=openai_key)
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": NLU_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"User Prompt: {prompt}"},
+                ],
+            )
+            return json.loads(resp.choices[0].message.content.strip())
+        except Exception as e:
+            print(f"[NLU LLM] OpenAI NLU call failed: {e}")
+            
+    return None
+
+def _handle_scan_analysis(prompt: str, session_id: str, persona: PersonaType, nlu_data: Dict[str, Any]) -> ChatResponse:
+    start_time = time.perf_counter()
+    if not scan_ledger.is_loaded:
+        text = (
+            "No vulnerability scan file has been uploaded yet. "
+            "Please upload a JSON or CSV scan export file using the 'Scan Ingestion' sidebar in the UI to perform scan analysis."
+        )
+        context_payload = _build_dummy_context_payload(session_id, persona)
+        latency_ms = (time.perf_counter() - start_time) * 1000.0
+        return ChatResponse(
+            session_id=session_id,
+            persona=persona,
+            formatted_output=text,
+            context_payload=context_payload,
+            latency_ms=round(latency_ms, 2),
+        )
+        
+    # We have findings!
+    findings = scan_ledger.list_findings()
+    findings_json = json.dumps(findings, indent=2)
+    
+    # Default fallback template summary
+    total = len(findings)
+    critical = sum(1 for f in findings if f.get("cvss_score", 0) >= 9.0 or f.get("severity") == "critical")
+    high = sum(1 for f in findings if (7.0 <= f.get("cvss_score", 0) < 9.0) or f.get("severity") == "high")
+    medium = sum(1 for f in findings if (4.0 <= f.get("cvss_score", 0) < 7.0) or f.get("severity") == "medium")
+    assets = list(set(f.get("asset_name") for f in findings if f.get("asset_name")))
+    
+    fallback_text = (
+        f"VULNERABILITY SCAN SUMMARY:\n"
+        f"Total Ingested Findings: {total}\n"
+        f"Severity Breakdown: Critical ({critical}), High ({high}), Medium ({medium})\n"
+        f"Affected Assets: {', '.join(assets)}\n\n"
+        f"Top Findings:\n"
+    )
+    for f in findings[:5]:
+        fallback_text += f"- [{f.get('cve_id')}] on {f.get('asset_name')} (CVSS: {f.get('cvss_score')}) - {f.get('description')}\n"
+        
+    text = fallback_text
+    
+    system_instruction = ""
+    if persona == PersonaType.BUSINESS:
+        system_instruction = (
+            "You are the CyberRiskIQ Business Copilot. Summarize the vulnerability scan findings for an executive audience. "
+            "Highlight the total number of findings, critical vulnerabilities, affected assets, and potential business/financial risks of not patching them. "
+            "Do not include technical jargon like CVSS vectors or raw CVE attributions in detail unless relevant to financial tiers. "
+            "Strictly do not hallucinate any math calculations, but explain the threat landscape based on the findings."
+        )
+    else:
+        system_instruction = (
+            "You are the CyberRiskIQ Technical Copilot. Provide a technical SecOps summary of the vulnerability scan findings. "
+            "List the CVEs, CVSS scores, threat indicators (weaponization, PoC), and affected assets. "
+            "Recommend remediation priorities based on severity."
+        )
+        
+    user_content = f"Vulnerability Scan Findings JSON:\n{findings_json}\n\nUser Question: {prompt}"
+    
+    # Try calling LLM to format nicely
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    if gemini_key:
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=gemini_key)
+            model = genai.GenerativeModel(
+                model_name="gemini-3.6-flash",
+                system_instruction=system_instruction
+            )
+            resp = model.generate_content(user_content)
+            if resp and resp.text:
+                text = resp.text
+        except Exception:
+            pass
+    elif openai_key:
+        try:
+            import openai
+            client = openai.OpenAI(api_key=openai_key)
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": user_content},
+                ],
+            )
+            text = resp.choices[0].message.content
+        except Exception:
+            pass
+            
+    context_payload = _build_dummy_context_payload(session_id, persona)
+    if findings:
+        try:
+            first_finding = findings[0]
+            cve_id = first_finding.get("cve_id", "CVE-2024-1234")
+            asset_name = first_finding.get("asset_name", "Core Payment Switch")
+            
+            execution_payload = _run_core_engines(f"Calculate risk for {asset_name} with {cve_id}", {})
+            context_payload = _build_context_payload(execution_payload, session_id, persona)
+        except Exception:
+            pass
+
+    latency_ms = (time.perf_counter() - start_time) * 1000.0
+    return ChatResponse(
+        session_id=session_id,
+        persona=persona,
+        formatted_output=text,
+        context_payload=context_payload,
+        latency_ms=round(latency_ms, 2),
+    )
 
 
 def _extract_slots(prompt: str) -> Dict[str, Any]:
@@ -257,7 +461,7 @@ def _build_context_payload(payload: ExecutionPayload, session_id: str, persona: 
 
 
 def _analyze_query_intent(prompt: str) -> str:
-    """Classify prompt into UNIDENTIFIED, CONVERSATIONAL, GENERAL_KNOWLEDGE, or RISK_QUANTIFICATION."""
+    """Classify prompt into UNIDENTIFIED, CONVERSATIONAL, GENERAL_KNOWLEDGE, SCAN_ANALYSIS, or RISK_QUANTIFICATION."""
     clean = (prompt or "").strip()
     if not clean:
         return "UNIDENTIFIED"
@@ -269,6 +473,11 @@ def _analyze_query_intent(prompt: str) -> str:
         return "UNIDENTIFIED"
     
     lower = clean.lower()
+    
+    # 1.5 Scan analysis detection (e.g. "what are findings from uploaded file", "scan summary")
+    scan_keywords = ["scan", "upload", "uploaded", "finding", "findings", "vulnerabilities", "vulnerability"]
+    if any(k in lower for k in scan_keywords):
+        return "SCAN_ANALYSIS"
 
     # 2. Conversational greetings / general system info
     if any(lower.startswith(g) for g in ["hi", "hello", "hey", "greetings", "good morning", "good evening"]):
@@ -413,9 +622,55 @@ async def chat_business(request: ChatRequest) -> ChatResponse:
     start_time = time.perf_counter()
     prompt = request.prompt or ""
 
+    # Try LLM NLU parse first
+    nlu_data = _call_llm_nlu(prompt)
+    if nlu_data:
+        intent = nlu_data.get("intent", "UNIDENTIFIED")
+        if intent == "SCAN_ANALYSIS":
+            return _handle_scan_analysis(prompt, request.session_id, PersonaType.BUSINESS, nlu_data)
+        elif intent in ["CONVERSATIONAL", "UNIDENTIFIED", "GENERAL_KNOWLEDGE"]:
+            resp_text = synthesizer.generate_conversational_response(prompt, PersonaType.BUSINESS)
+            context_payload = _build_dummy_context_payload(request.session_id, PersonaType.BUSINESS)
+            latency_ms = (time.perf_counter() - start_time) * 1000.0
+            return ChatResponse(
+                session_id=request.session_id,
+                persona=PersonaType.BUSINESS,
+                formatted_output=resp_text,
+                context_payload=context_payload,
+                latency_ms=round(latency_ms, 2),
+            )
+        else: # RISK_QUANTIFICATION
+            overrides = {}
+            if nlu_data.get("asset_name"):
+                overrides["asset_name"] = nlu_data["asset_name"]
+            if nlu_data.get("cve_id"):
+                overrides["cve_id"] = nlu_data["cve_id"]
+            if nlu_data.get("budget_lakhs") is not None:
+                overrides["budget_lakhs"] = nlu_data["budget_lakhs"]
+            
+            req_overrides = request.context_overrides or {}
+            combined_overrides = {**overrides, **req_overrides}
+            
+            execution_payload = _run_core_engines(prompt, combined_overrides)
+            formatted_output = format_business_briefing(execution_payload, prompt)
+            passed, errors = guardrail.verify_financial_integrity(execution_payload, formatted_output)
+            context_payload = _build_context_payload(execution_payload, request.session_id, PersonaType.BUSINESS)
+            context_payload.guardrail_passed = passed
+            context_payload.guardrail_errors = errors
+            latency_ms = (time.perf_counter() - start_time) * 1000.0
+            return ChatResponse(
+                session_id=request.session_id,
+                persona=PersonaType.BUSINESS,
+                formatted_output=formatted_output,
+                context_payload=context_payload,
+                latency_ms=round(latency_ms, 2),
+            )
+
     # Classify query intent
     query_type = _analyze_query_intent(prompt)
-    if query_type in ["UNIDENTIFIED", "CONVERSATIONAL"]:
+    if query_type == "SCAN_ANALYSIS":
+        return _handle_scan_analysis(prompt, request.session_id, PersonaType.BUSINESS, {})
+    elif query_type in ["UNIDENTIFIED", "CONVERSATIONAL"]:
         return _handle_unidentified_or_conversational(prompt, request.session_id, PersonaType.BUSINESS, query_type)
     elif query_type == "GENERAL_KNOWLEDGE":
         return _handle_general_knowledge(prompt, request.session_id, PersonaType.BUSINESS)
@@ -450,9 +705,55 @@ async def chat_technical(request: ChatRequest) -> ChatResponse:
     start_time = time.perf_counter()
     prompt = request.prompt or ""
 
+    # Try LLM NLU parse first
+    nlu_data = _call_llm_nlu(prompt)
+    if nlu_data:
+        intent = nlu_data.get("intent", "UNIDENTIFIED")
+        if intent == "SCAN_ANALYSIS":
+            return _handle_scan_analysis(prompt, request.session_id, PersonaType.TECHNICAL, nlu_data)
+        elif intent in ["CONVERSATIONAL", "UNIDENTIFIED", "GENERAL_KNOWLEDGE"]:
+            resp_text = synthesizer.generate_conversational_response(prompt, PersonaType.TECHNICAL)
+            context_payload = _build_dummy_context_payload(request.session_id, PersonaType.TECHNICAL)
+            latency_ms = (time.perf_counter() - start_time) * 1000.0
+            return ChatResponse(
+                session_id=request.session_id,
+                persona=PersonaType.TECHNICAL,
+                formatted_output=resp_text,
+                context_payload=context_payload,
+                latency_ms=round(latency_ms, 2),
+            )
+        else: # RISK_QUANTIFICATION
+            overrides = {}
+            if nlu_data.get("asset_name"):
+                overrides["asset_name"] = nlu_data["asset_name"]
+            if nlu_data.get("cve_id"):
+                overrides["cve_id"] = nlu_data["cve_id"]
+            if nlu_data.get("budget_lakhs") is not None:
+                overrides["budget_lakhs"] = nlu_data["budget_lakhs"]
+            
+            req_overrides = request.context_overrides or {}
+            combined_overrides = {**overrides, **req_overrides}
+            
+            execution_payload = _run_core_engines(prompt, combined_overrides)
+            formatted_output = format_technical_diagnostic(execution_payload, prompt)
+            passed, errors = guardrail.verify_financial_integrity(execution_payload, formatted_output)
+            context_payload = _build_context_payload(execution_payload, request.session_id, PersonaType.TECHNICAL)
+            context_payload.guardrail_passed = passed
+            context_payload.guardrail_errors = errors
+            latency_ms = (time.perf_counter() - start_time) * 1000.0
+            return ChatResponse(
+                session_id=request.session_id,
+                persona=PersonaType.TECHNICAL,
+                formatted_output=formatted_output,
+                context_payload=context_payload,
+                latency_ms=round(latency_ms, 2),
+            )
+
     # Classify query intent
     query_type = _analyze_query_intent(prompt)
-    if query_type in ["UNIDENTIFIED", "CONVERSATIONAL"]:
+    if query_type == "SCAN_ANALYSIS":
+        return _handle_scan_analysis(prompt, request.session_id, PersonaType.TECHNICAL, {})
+    elif query_type in ["UNIDENTIFIED", "CONVERSATIONAL"]:
         return _handle_unidentified_or_conversational(prompt, request.session_id, PersonaType.TECHNICAL, query_type)
     elif query_type == "GENERAL_KNOWLEDGE":
         return _handle_general_knowledge(prompt, request.session_id, PersonaType.TECHNICAL)

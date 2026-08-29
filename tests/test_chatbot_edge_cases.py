@@ -271,3 +271,55 @@ class TestModelStatusEndpoint:
         assert "fallback_active" in data
         assert "embedding_candidates" in data
         assert "generation_candidates" in data
+
+
+# ============================================================================
+# Test 8: LLM NLU Parsing and Scan Analysis Queries
+# ============================================================================
+class TestLLMNLUParsing:
+    """Verify NLU routing for vague terms like 'budget' and scan queries."""
+
+    def test_scan_analysis_without_upload(self):
+        # Clear scan first
+        client.delete("/api/v1/scan/clear")
+        
+        # Query chatbot
+        result = _biz("what are findings from uoloaded file")
+        assert result["status"] == 200
+        output = result["data"]["formatted_output"]
+        assert "no vulnerability scan" in output.lower() or "upload" in output.lower()
+
+    def test_scan_analysis_with_upload(self):
+        # Ingest a scan finding
+        scan_data = json.dumps([
+            {
+                "cve_id": "CVE-2024-3094",
+                "asset_name": "Core Payment Switch",
+                "vendor": "openvpn",
+                "cvss_score": 9.8,
+                "tags": ["remote"],
+                "exploit_weaponized": True,
+                "poc_published": True,
+                "description": "Backdoor in xz-utils.",
+                "severity": "critical",
+            }
+        ])
+        from io import BytesIO
+        client.post(
+            "/api/v1/scan/upload",
+            files={"file": ("scan.json", BytesIO(scan_data.encode()), "application/json")},
+        )
+        
+        # Query chatbot
+        result = _biz("what are findings from uoloaded file")
+        assert result["status"] == 200
+        output = result["data"]["formatted_output"]
+        assert len(output) > 20
+        assert "3094" in output or "findings" in output.lower()
+
+    def test_vague_budget_query(self):
+        # Sending just "budget" should be conversational clarification or standard risk depending on API availability
+        result = _biz("budget")
+        assert result["status"] == 200
+        output = result["data"]["formatted_output"]
+        assert len(output) > 10
