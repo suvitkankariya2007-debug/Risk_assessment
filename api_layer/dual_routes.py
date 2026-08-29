@@ -475,7 +475,11 @@ def _analyze_query_intent(prompt: str) -> str:
     lower = clean.lower()
     
     # 1.5 Scan analysis detection (e.g. "what are findings from uploaded file", "scan summary")
-    scan_keywords = ["scan", "upload", "uploaded", "finding", "findings", "vulnerabilities", "vulnerability"]
+    scan_keywords = [
+        "scan", "upload", "uploaded", "finding", "findings", 
+        "vulnerabilities", "vulnerability", "vuln", "vulner", 
+        "vukner", "explout", "report", "file", "invest", "analysed", "analyzed"
+    ]
     if any(k in lower for k in scan_keywords):
         return "SCAN_ANALYSIS"
 
