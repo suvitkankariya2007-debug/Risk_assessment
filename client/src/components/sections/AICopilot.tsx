@@ -3,12 +3,18 @@ import { Send, Sparkles, Bot } from "lucide-react";
 
 type Role = "user" | "copilot";
 
+type Persona = "Executive" | "CISO" | "Analyst";
+
 interface Message {
   id: number;
   role: Role;
   text: string;
   citation?: string;
   timestamp: Date;
+}
+
+interface VerifiedMetrics {
+  [key: string]: number | string;
 }
 
 const INITIAL_MESSAGES: Message[] = [
@@ -20,44 +26,6 @@ const INITIAL_MESSAGES: Message[] = [
     timestamp: new Date(Date.now() - 120000),
   },
 ];
-
-const CANNED_RESPONSES: Record<string, { text: string; citation: string }> = {
-  mfa: {
-    text: "Enforcing MFA on all privileged and remote-access accounts reduces org-wide EAL by an estimated ₹68L/yr (14%), primarily by cutting credential-theft loss-event frequency on Payments and Corporate IT. Estimated rollout cost is ₹12L, giving a ROSI of 467% — one of the highest-yield controls available this cycle.",
-    citation: "Scenario simulator · run #A114 · Control: Enforce MFA on all privileged accounts",
-  },
-  vuln: {
-    text: "Three findings account for 41% of total EAL: an unpatched Apache Struts RCE on the payments gateway (₹61L), an over-permissioned IAM role on the core banking cluster (₹48L), and unencrypted backups in the corporate file share (₹22L). Full ranked list is in the Risk Quantification view.",
-    citation: "Risk register · top-3 by EAL contribution · last recomputed 4 min ago",
-  },
-  rosi: {
-    text: "Top ROSI controls this cycle: MFA rollout (467%), critical-CVE patch SLA (312%), EDR coverage to 100% (204%). The investment optimizer module can bundle these into a single spend recommendation under your budget constraint.",
-    citation: "Investment Optimizer · knapsack solve #K-09 · ₹34L budget",
-  },
-  compliance: {
-    text: "Your weakest framework is RBI CSF at 69% — driven mainly by the network segmentation gap (Clause 5.4) and incomplete access-logging on the payments switch. Fixing these two controls would raise RBI CSF coverage to approximately 84% and close 4 open findings.",
-    citation: "Compliance Mapping · RBI CSF gap analysis · 4 open clauses",
-  },
-  eal: {
-    text: "Current org-wide Expected Annual Loss is ₹4.82 Cr (95th-percentile VaR: ₹9.15 Cr). Core Banking DB Cluster is the largest single contributor at ₹1.12 Cr. The 12-month trend shows a 14% reduction from ₹5.61 Cr — driven by the IAM consolidation project completed in Q2.",
-    citation: "Executive Overview · Monte Carlo engine · 18,421 evidence points",
-  },
-  default: {
-    text: "Based on the current risk ledger, I can see that query relates to your exposure model. The Monte Carlo engine last ran 4 minutes ago across 86 assets and 4 business units. For a precise answer, try asking about a specific asset, business unit, control, or framework — or use one of the suggestion chips below.",
-    citation: "Risk ledger · last sync 4 min ago",
-  },
-};
-
-function pickResponse(input: string): { text: string; citation: string } {
-  const q = input.toLowerCase();
-  if (q.includes("mfa") || q.includes("multi-factor") || q.includes("authentication")) return CANNED_RESPONSES.mfa;
-  if (q.includes("vuln") || q.includes("loss") || q.includes("drive") || q.includes("contribut")) return CANNED_RESPONSES.vuln;
-  if (q.includes("rosi") || q.includes("return") || q.includes("invest") || q.includes("q2") || q.includes("q3")) return CANNED_RESPONSES.rosi;
-  if (q.includes("compliance") || q.includes("framework") || q.includes("rbi") || q.includes("iso") || q.includes("nist")) return CANNED_RESPONSES.compliance;
-  if (q.includes("eal") || q.includes("exposure") || q.includes("annual loss") || q.includes("var")) return CANNED_RESPONSES.eal;
-  if (q.includes("business unit") || q.includes("highest risk")) return CANNED_RESPONSES.vuln;
-  return CANNED_RESPONSES.default;
-}
 
 const CHIPS = [
   "Highest risk by business unit",
@@ -73,6 +41,8 @@ export default function AICopilot() {
   const [messages, setMessages] = useState<Message[]>(INITIAL_MESSAGES);
   const [input, setInput] = useState("");
   const [isTyping, setIsTyping] = useState(false);
+  const [persona, setPersona] = useState<Persona>("Executive");
+  const [verifiedMetrics, setVerifiedMetrics] = useState<VerifiedMetrics>({});
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -80,7 +50,7 @@ export default function AICopilot() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isTyping]);
 
-  const send = (text: string) => {
+  const send = async (text: string) => {
     const trimmed = text.trim();
     if (!trimmed || isTyping) return;
 
@@ -94,23 +64,45 @@ export default function AICopilot() {
     setInput("");
     setIsTyping(true);
 
-    const delay = 1200 + Math.random() * 800;
-    setTimeout(() => {
-      const response = pickResponse(trimmed);
+    try {
+      const response = await fetch("/api/v1/chat/message", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: trimmed, persona }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Copilot request failed");
+      }
+
+      const data = await response.json();
       const botMsg: Message = {
         id: nextId++,
         role: "copilot",
-        text: response.text,
-        citation: response.citation,
+        text: data.reply,
+        citation: (data.cited_sources || []).join(" · "),
         timestamp: new Date(),
       };
+
       setMessages((prev) => [...prev, botMsg]);
+      setVerifiedMetrics(data.verified_metrics || {});
+    } catch (error) {
+      console.error(error);
+      const fallback: Message = {
+        id: nextId++,
+        role: "copilot",
+        text: "The copilot service is unavailable right now. Please try again in a moment.",
+        citation: "Backend unavailable",
+        timestamp: new Date(),
+      };
+      setMessages((prev) => [...prev, fallback]);
+    } finally {
       setIsTyping(false);
-    }, delay);
+    }
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleSubmit = (event: React.FormEvent) => {
+    event.preventDefault();
     send(input);
   };
 
@@ -131,16 +123,22 @@ export default function AICopilot() {
           <h1>Ask the risk ledger a question</h1>
           <p>RAG over live risk tables and framework documents. Every answer cites the underlying EAL figure, never a bare claim.</p>
         </div>
-        <div className="copilot-status-badge">
-          <span className="footer-live" style={{ width: 7, height: 7, flexShrink: 0 }} />
-          <span style={{ fontSize: 9, color: "var(--green)", fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase" }}>
-            Model active
-          </span>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          {(["Executive", "CISO", "Analyst"] as Persona[]).map((item) => (
+            <button
+              key={item}
+              type="button"
+              className={`chip ${persona === item ? "active" : ""}`}
+              onClick={() => setPersona(item)}
+              style={{ padding: "7px 10px" }}
+            >
+              {item}
+            </button>
+          ))}
         </div>
       </div>
 
       <div className="copilot-grid">
-        {/* Chat area */}
         <div className="chat-interface stagger-enter stagger-2">
           <div className="chat-history">
             {messages.map((msg) => (
@@ -194,23 +192,13 @@ export default function AICopilot() {
                 onChange={(e) => setInput(e.target.value)}
                 disabled={isTyping}
               />
-              <button
-                className="primary-button ask-button"
-                type="submit"
-                disabled={!input.trim() || isTyping}
-              >
+              <button className="primary-button ask-button" type="submit" disabled={!input.trim() || isTyping}>
                 <Send size={13} /> Ask
               </button>
             </div>
             <div className="suggestion-chips">
               {CHIPS.map((chip) => (
-                <button
-                  key={chip}
-                  type="button"
-                  className="chip"
-                  onClick={() => handleChip(chip)}
-                  disabled={isTyping}
-                >
+                <button key={chip} type="button" className="chip" onClick={() => handleChip(chip)} disabled={isTyping}>
                   {chip}
                 </button>
               ))}
@@ -218,9 +206,25 @@ export default function AICopilot() {
           </form>
         </div>
 
-        {/* Sidebar */}
         <div className="copilot-sidebar">
           <div className="terminal-card sidebar-card stagger-enter stagger-3">
+            <h3>Verified metrics</h3>
+            <span className="eyebrow">NUMBERS FROM API</span>
+            <div style={{ display: "grid", gap: 8, marginTop: 12 }}>
+              {Object.entries(verifiedMetrics).length === 0 ? (
+                <span style={{ color: "#a7b2bf" }}>No metrics yet.</span>
+              ) : (
+                Object.entries(verifiedMetrics).map(([key, value]) => (
+                  <div key={key} style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                    <span style={{ color: "#a7b2bf", textTransform: "capitalize" }}>{key.replace(/_/g, " ")}</span>
+                    <strong style={{ color: "#eaf0f7" }}>{String(value)}</strong>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+
+          <div className="terminal-card sidebar-card stagger-enter stagger-4">
             <h3>Model grounding</h3>
             <span className="eyebrow">WHAT THE COPILOT READS</span>
             <ul className="grounding-list">
@@ -236,11 +240,11 @@ export default function AICopilot() {
             <span className="eyebrow">THIS SESSION</span>
             <div className="session-stats">
               <div className="session-stat">
-                <strong>{messages.filter(m => m.role === "user").length}</strong>
+                <strong>{messages.filter((message) => message.role === "user").length}</strong>
                 <span>questions asked</span>
               </div>
               <div className="session-stat">
-                <strong>{messages.filter(m => m.role === "copilot").length}</strong>
+                <strong>{messages.filter((message) => message.role === "copilot").length}</strong>
                 <span>answers with citations</span>
               </div>
             </div>
