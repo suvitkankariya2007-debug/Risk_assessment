@@ -214,14 +214,14 @@ Following a context hard-limit crash, an audit was performed to check the real r
 
 ### Phase 1: New Risk-Quantification Modules - **CREATED BUT BROKEN**
 *   All new engine files (`business_profile.py`, `segment_risk.py`, `control_maturity.py`, `rosi_v2.py`, `cia_exposure.py`, `domain_priority.py`) were created.
-*   **Critical Bug:** `build_business_profile` function was never implemented in `business_profile.py` (only the `BusinessProfileEngine` class exists). This causes `ImportError` in `dual_routes.py` and completely breaks the `pytest` test suite (fails to collect tests).
+*   **Critical Bug:** Fixed. `build_business_profile` is now implemented as a module-level shim in `business_profile.py`, resolving the `ImportError`.
 
 ### Phase 2: Wiring & API Layer - **INCOMPLETE**
 *   **7. Schemas:** Done. `schemas/data_models.py` updated.
 *   **8. NLU Slots:** Done. `_extract_slots()` in `dual_routes.py` captures the new extensions via regex.
-*   **9. Synthesizer Templates:** **NOT DONE.** `api_layer/synthesizer.py` still outputs raw acronyms (`VaR`, `EAL`, `ROSI`) instead of plain-English sentences for the Executive persona, and the lint/banned token check is missing.
-*   **10. Guardrails:** **NOT DONE.** `api_layer/guardrails.py` (`_collect_payload_numbers`) ignores all new Phase 1 numeric fields (e.g., SegImpact, Exposure, etc.).
-*   **11. Tests:** **NOT DONE.** No tests were written for the new formulas in `tests/test_engines.py`.
+*   **9. Synthesizer Templates:** **DONE.** `api_layer/synthesizer.py` was updated to output plain-English phrases (e.g. "Average Potential Yearly Loss" instead of `EAL`) for the Executive persona. A banned token lint checks and removes any acronyms before sending the payload.
+*   **10. Guardrails:** **DONE.** Fixed `api_layer/guardrails.py` to include Phase 1 numeric fields inside `_collect_payload_numbers` before validation, ensuring proper grounding checks.
+*   **11. Tests:** **DONE.** `tests/test_phase1.py` created and all Phase 1 invariants pass (7/7 passing).
 *   **12. Documentation:** Currently being updated by this audit.
 
 ### Next Session Directives

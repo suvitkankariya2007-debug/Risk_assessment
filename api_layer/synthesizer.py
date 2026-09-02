@@ -177,7 +177,7 @@ def template_business_briefing(data: Dict[str, Any], prompt: str = "") -> str:
         custom_intro = (
             f"DIRECT ANSWER TO YOUR BUDGET INQUIRY:\n"
             f"Allocating ₹{data['control_cost_cr']*100:.1f} Lakhs (₹{data['control_cost_cr']:.2f} Cr) is {viable_str}.\n"
-            f"The Gordon-Loeb optimal capital ceiling is ₹{data['gordon_loeb_cap_cr']:.2f} Cr, and the projected Return on Security Investment (ROSI) is {data['rosi_pct']:.1f}%.\n\n"
+            f"The Gordon-Loeb optimal capital ceiling is ₹{data['gordon_loeb_cap_cr']:.2f} Cr, and the projected return on security investment is {data['rosi_pct']:.1f}%.\n\n"
         )
     elif "downtime" in lower or "primary" in lower or "secondary" in lower or "penalty" in lower:
         custom_intro = (
@@ -187,17 +187,17 @@ def template_business_briefing(data: Dict[str, Any], prompt: str = "") -> str:
 
     return (
         f"{custom_intro}EXECUTIVE RISK BRIEFING\n"
-        f"Target Asset: {data['asset_name']} | Threat CVE: {data['cve_id']}\n\n"
+        f"Target Asset: {data['asset_name']} | Threat Identifier: {data['cve_id']}\n\n"
         f"1. Financial Exposure:\n"
-        f"   - Expected Annual Loss (EAL): ₹{data['eal_cr']:.2f} Cr\n"
-        f"   - 95% Value-at-Risk (VaR): ₹{data['var_95_cr']:.2f} Cr\n"
+        f"   - Average Potential Yearly Loss: ₹{data['eal_cr']:.2f} Cr\n"
+        f"   - Bad-Case Scenario Loss (95th percentile): ₹{data['var_95_cr']:.2f} Cr\n"
         f"   - Operational Downtime Loss: ₹{data['primary_loss_cr']:.2f} Cr\n"
         f"   - Regulatory & Secondary Penalties: ₹{data['secondary_loss_cr']:.2f} Cr\n\n"
         f"2. {explanation_why_lost}\n\n"
         f"3. Security Economics & Recommendation:\n"
         f"   - Proposed Control Cost: ₹{data['control_cost_cr']:.2f} Cr\n"
         f"   - Anticipated Risk Reduction: ₹{data['risk_reduced_cr']:.2f} Cr\n"
-        f"   - Return on Security Investment (ROSI): {data['rosi_pct']:.1f}%\n"
+        f"   - Return on Security Investment: {data['rosi_pct']:.1f}%\n"
         f"   - Gordon-Loeb Capital Ceiling: ₹{data['gordon_loeb_cap_cr']:.2f} Cr\n"
         f"   - Assessment: The proposed investment is {viable_str}.\n"
     )
@@ -331,10 +331,25 @@ def format_business_briefing(payload: Any, prompt: str = "") -> str:
     if not llm_output:
         llm_output = call_external_llm(system_instruction, data, user_prompt=prompt)
         
-    if llm_output:
-        return llm_output
+    final_output = llm_output if llm_output else template_business_briefing(data, prompt)
+    
+    # Banned-token lint/check for business-persona output
+    banned_replacements = {
+        r"\bEAL\b": "Average Potential Yearly Loss",
+        r"\bVaR(?:_95)?\b": "Bad-Case Scenario Loss",
+        r"\bALE\b": "Annualized Loss Expectancy",
+        r"\bZ-?ROSI\b": "Adjusted Return on Security Investment",
+        r"\bROSI\b": "Return on Security Investment",
+        r"\bCIA\b": "Confidentiality, Integrity, and Availability",
+        r"\bSegImpact\b": "Segment Financial Impact",
+        r"\bD_priority\b": "Domain Priority",
+    }
+    
+    import re
+    for pattern, replacement in banned_replacements.items():
+        final_output = re.sub(pattern, replacement, final_output, flags=re.IGNORECASE)
         
-    return template_business_briefing(data, prompt)
+    return final_output
 
 
 def format_technical_diagnostic(payload: Any, prompt: str = "") -> str:

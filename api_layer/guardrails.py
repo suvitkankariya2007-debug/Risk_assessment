@@ -87,6 +87,8 @@ def _collect_payload_numbers(payload: Any) -> Set[float]:
             if isinstance(v, (int, float)):
                 nums.add(round(float(v), 2))
                 nums.add(round(float(v), 4))
+                
+    _add_phase1_extensions(payload, nums)
 
     return nums
 
@@ -147,13 +149,9 @@ class SanityGuardrailVerifier:
         if isinstance(payload, ExecutionPayload):
             if payload.rosi_result:
                 is_viable = payload.rosi_result.is_economically_viable
-            # Check Phase-1 extensions for ExecutionPayload
-            _add_phase1_extensions(payload, valid_nums)
         elif isinstance(payload, DeterministicContextPayload):
             if payload.milprosi:
                 is_viable = payload.milprosi.is_economically_viable
-            # Check Phase-1 extensions for DeterministicContextPayload
-            _add_phase1_extensions(payload, valid_nums)
 
         if is_viable is False:
             text_lower = text.lower()

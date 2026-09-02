@@ -158,7 +158,10 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);-webkit-font
 
   <!-- Chat Area -->
   <div class="chat-area">
-    <div class="messages" id="messages">
+    <div class="messages" id="messages-business">
+      <!-- Welcome message injected by JS -->
+    </div>
+    <div class="messages" id="messages-technical" style="display: none;">
       <!-- Welcome message injected by JS -->
     </div>
     <div class="typing" id="typing"><span></span><span></span><span></span></div>
@@ -219,7 +222,8 @@ let queryCount = 0;
 const sessionId = 'session-' + Date.now();
 
 // ── DOM Refs ──
-const messagesEl = document.getElementById('messages');
+const messagesBiz  = document.getElementById('messages-business');
+const messagesTech = document.getElementById('messages-technical');
 const inputEl    = document.getElementById('chatInput');
 const askBtn     = document.getElementById('askBtn');
 const typingEl   = document.getElementById('typing');
@@ -238,6 +242,15 @@ function setPersona(p) {
   inputEl.placeholder = p === 'business'
     ? 'Ask about financial exposure, budget viability, ROSI...'
     : 'Ask about CVE exploitability, EPSS odds, XAI trust...';
+    
+  if (p === 'business') {
+    messagesBiz.style.display = 'block';
+    messagesTech.style.display = 'none';
+  } else {
+    messagesBiz.style.display = 'none';
+    messagesTech.style.display = 'block';
+  }
+  scrollBottom();
 }
 
 // ── Submit Handlers ──
@@ -301,7 +314,8 @@ function appendMessage(role, text) {
       <div class="msg-meta">${role === 'user' ? 'You' : 'BASIS Copilot'} · ${timeNow()}</div>
       <div class="msg-content">${escHtml(text)}</div>
     </div>`;
-  messagesEl.appendChild(div);
+  const targetMessagesEl = activePersona === 'business' ? messagesBiz : messagesTech;
+  targetMessagesEl.appendChild(div);
   scrollBottom();
 }
 
@@ -325,7 +339,8 @@ function appendBotMessage(data) {
       ${guardrailHtml}
       ${routeHtml}
     </div>`;
-  messagesEl.appendChild(div);
+  const targetMessagesEl = activePersona === 'business' ? messagesBiz : messagesTech;
+  targetMessagesEl.appendChild(div);
   scrollBottom();
 }
 
@@ -372,7 +387,15 @@ function highlightMetrics(text) {
 function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 function num(v) { return v != null ? Number(v).toFixed(2) : '—'; }
 function timeNow() { return new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }); }
-function scrollBottom() { requestAnimationFrame(() => { messagesEl.scrollTop = messagesEl.scrollHeight; }); }
+function scrollBottom() { 
+  requestAnimationFrame(() => { 
+    if (activePersona === 'business') {
+      messagesBiz.scrollTop = messagesBiz.scrollHeight; 
+    } else {
+      messagesTech.scrollTop = messagesTech.scrollHeight; 
+    }
+  }); 
+}
 
 // ── Welcome Message ──
 (function init() {
@@ -392,7 +415,8 @@ function scrollBottom() { requestAnimationFrame(() => { messagesEl.scrollTop = m
         </span>
       </div>
     </div>`;
-  messagesEl.appendChild(welcome);
+  messagesBiz.appendChild(welcome);
+  messagesTech.appendChild(welcome.cloneNode(true));
 })();
 
 // ── Scan File Upload Handler ──
