@@ -11,7 +11,10 @@ they fall back to the static mock_kb baseline.
 import csv
 import io
 import json
+import os
 import re
+import sqlite3
+import threading
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -26,6 +29,7 @@ class ScanFinding(BaseModel):
     asset_name: str
     vendor: str = "unknown"
     cvss_score: float = 0.0
+    cvss_vector: str = ""
     tags: List[str] = []
     exploit_weaponized: bool = False
     poc_published: bool = False
@@ -44,13 +48,79 @@ class ScanUploadResponse(BaseModel):
 
 # ── Ledger Singleton ────────────────────────────────────────────────────────
 class ScanLedger:
-    """Thread-safe in-memory cache of parsed scan findings."""
+    """Thread-safe scan-findings cache with SQLite write-through persistence.
+
+    In-memory dicts remain the hot-path read source (no disk round-trip on
+    the request path). Uploaded findings survive server restarts via the
+    SQLite database, which is loaded once at process startup.
+    """
 
     def __init__(self) -> None:
         self._findings: List[ScanFinding] = []
         self._by_cve: Dict[str, ScanFinding] = {}
         self._by_asset: Dict[str, List[ScanFinding]] = {}
         self.scan_count: int = 0
+        self._lock = threading.RLock()
+        # Phase 0c: persistence layer (SQLite file; path overridable via env)
+        self._db_path = os.environ.get(
+            "SCAN_LEDGER_DB",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scan_ledger.db"),
+        )
+        self._init_db()
+        self._load_from_db()
+
+    # ── Persistence helpers ─────────────────────────────────────────────────
+    def _init_db(self) -> None:
+        try:
+            con = sqlite3.connect(self._db_path)
+            try:
+                con.execute(
+                    "CREATE TABLE IF NOT EXISTS scan_findings ("
+                    " cve_id TEXT PRIMARY KEY, payload TEXT NOT NULL,"
+                    " ingested_at TEXT NOT NULL)"
+                )
+                con.commit()
+            finally:
+                con.close()
+        except Exception:
+            # Persistence is best-effort; the in-memory ledger keeps working.
+            pass
+
+    def _load_from_db(self) -> None:
+        try:
+            con = sqlite3.connect(self._db_path)
+            try:
+                rows = con.execute(
+                    "SELECT payload FROM scan_findings"
+                ).fetchall()
+            finally:
+                con.close()
+            for (payload_json,) in rows:
+                try:
+                    f = ScanFinding(**json.loads(payload_json))
+                    self._findings.append(f)
+                    self._by_cve[f.cve_id.upper()] = f
+                    key = f.asset_name.lower().strip()
+                    self._by_asset.setdefault(key, []).append(f)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def _persist(self, f: ScanFinding) -> None:
+        try:
+            con = sqlite3.connect(self._db_path)
+            try:
+                con.execute(
+                    "INSERT OR REPLACE INTO scan_findings"
+                    " (cve_id, payload, ingested_at) VALUES (?, ?, ?)",
+                    (f.cve_id.upper(), f.model_dump_json(), f.ingested_at),
+                )
+                con.commit()
+            finally:
+                con.close()
+        except Exception:
+            pass
 
     # ── Query API ───────────────────────────────────────────────────────────
     @property
@@ -69,7 +139,13 @@ class ScanLedger:
             "poc_published": f.poc_published,
             "reference_count": f.reference_count,
             "description": f.description,
+            "cvss_score": f.cvss_score,
+            "cvss_vector": f.cvss_vector,
         }
+
+    def lookup_finding(self, cve_id: str) -> Optional[ScanFinding]:
+        """Return the raw ScanFinding for a CVE, or None if not found."""
+        return self._by_cve.get(cve_id.upper())
 
     def lookup_asset(self, asset_name: str) -> Optional[List[ScanFinding]]:
         """Return all findings for a given asset name."""
@@ -84,6 +160,15 @@ class ScanLedger:
         self._by_cve.clear()
         self._by_asset.clear()
         self.scan_count = 0
+        try:
+            con = sqlite3.connect(self._db_path)
+            try:
+                con.execute("DELETE FROM scan_findings")
+                con.commit()
+            finally:
+                con.close()
+        except Exception:
+            pass
 
     # ── Ingestion ───────────────────────────────────────────────────────────
     def ingest_json(self, raw: Any) -> int:
@@ -122,6 +207,8 @@ class ScanLedger:
         self._by_cve[f.cve_id.upper()] = f
         key = f.asset_name.lower().strip()
         self._by_asset.setdefault(key, []).append(f)
+        # Write-through persistence (memory stays the hot read path)
+        self._persist(f)
 
     def _normalize_finding(self, item: dict) -> Optional[ScanFinding]:
         """Normalize heterogeneous scan export formats into ScanFinding."""
@@ -155,8 +242,16 @@ class ScanLedger:
         if isinstance(tags_raw, str):
             tags_raw = [t.strip() for t in tags_raw.split(",")]
 
+        cvss_vector = str(
+            item.get("cvss_vector")
+            or item.get("vector")
+            or item.get("CVSS Vector")
+            or item.get("V3 Vector")
+            or ""
+        ).strip()
+
         try:
-            cvss = float(item.get("cvss_score") or item.get("cvss") or item.get("CVSS Score") or 0)
+            cvss = float(item.get("cvss_score") or item.get("cvss_base_score") or item.get("cvss") or item.get("CVSS Score") or 0)
         except (ValueError, TypeError):
             cvss = 0.0
 
@@ -177,6 +272,7 @@ class ScanLedger:
             asset_name=asset,
             vendor=vendor,
             cvss_score=cvss,
+            cvss_vector=cvss_vector,
             tags=tags_raw,
             exploit_weaponized=weaponized,
             poc_published=poc,

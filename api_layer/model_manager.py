@@ -10,8 +10,8 @@ inference fails.
 Model Tiers:
   - Tier 1 (Semantic Embeddings): sentence-transformers/all-MiniLM-L6-v2
                                    → BAAI/bge-small-en-v1.5
-  - Tier 2 (Local Generation):    microsoft/Phi-3-mini-4k-instruct
-                                   → Qwen/Qwen2.5-Coder-3B-Instruct
+  - Tier 2 (Local Generation):    Qwen/Qwen2.5-0.5B-Instruct (~350 MB)
+                                   → TinyLlama/TinyLlama-1.1B-Chat-v1.0 (~660 MB)
   - Tier 3 (Fallback):            Deterministic f-string templates (zero-math)
 """
 import gc
@@ -27,10 +27,12 @@ EMBEDDING_MODELS = [
 ]
 
 # ── Generation Model Candidates ─────────────────────────────────────────────
+# Low-disk, CPU-only instruction models (<1 GB total). Qwen2.5-0.5B is the
+# smallest viable structured-output formatter; TinyLlama is the quality
+# fallback. Weights download once into the venv HF cache (~350 MB + ~660 MB).
 GENERATION_MODELS = [
-    "microsoft/Phi-3-mini-4k-instruct",
-    "Qwen/Qwen2.5-Coder-3B-Instruct",
-    "meta-llama/Llama-3.2-3B-Instruct",
+    "Qwen/Qwen2.5-0.5B-Instruct",
+    "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
 ]
 
 

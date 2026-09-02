@@ -40,6 +40,12 @@ class EPSSPrediction(BaseModel):
     cve_id: str
     epss_probability: float = Field(ge=0.0, le=1.0)
     percentile: float = Field(ge=0.0, le=100.0)
+    # Real computed logistic z-score (replaces the hardcoded -1.5 placeholder).
+    # 0.0 default keeps older constructions backward compatible.
+    z_score: float = 0.0
+    # True when probability/percentile came from the live FIRST.org EPSS API.
+    live_epss: bool = False
+
 
 
 class FAIRSimulationResult(BaseModel):
@@ -74,6 +80,77 @@ class ROSIOptimizationResult(BaseModel):
     is_economically_viable: bool
 
 
+# ── Phase-1 extension engines (frozen, same contract style) ─────────────────
+
+class BusinessProfileResult(BaseModel):
+    """Output of the business-profile builder (unit + segment hierarchy)."""
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    business_unit_name: str
+    sector: str
+    country: str
+    employee_count: Optional[int] = None
+    segments: List[str]
+    total_revenue_cr: float
+
+
+class SegmentRiskResult(BaseModel):
+    """Output of the segment impact/risk engine."""
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    impact_operational: float
+    impact_financial: float
+    impact_w: float
+    seg_revenue_cr: float
+    seg_impact_cr: float
+    risk_w: float
+    seg_risk_cr: float
+    risk_weighting_factor: float = 1.0
+
+
+class ControlMaturityResult(BaseModel):
+    """Output of the control-maturity efficacy engine."""
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    maturity_level: str
+    maturity_multiplier: float
+    efficacy_t: float
+    control_efficacy_t: float
+
+
+class ZRosiResult(BaseModel):
+    """Output of the cost-adjusted ROSI (v2) engine."""
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    ale_cr: float
+    control_efficacy_t: float
+    control_cost_cr: float
+    cost_rate: float
+    z_rosi: float
+
+
+class CiaExposureResult(BaseModel):
+    """Output of the CIA-triad exposure / ALE engine."""
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    confidentiality: float
+    integrity: float
+    availability: float
+    exposure: float
+    seg_impact_cr: float
+    ale_cr: float
+
+
+class DomainPriorityResult(BaseModel):
+    """One ranked security-domain priority row."""
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    domain: str
+    t_w: float
+    impact_weight: float
+    d_priority: float
+
+
 class ExecutionPayload(BaseModel):
     """Immutable bundle of all deterministic compute results."""
     model_config = ConfigDict(frozen=True, strict=True)
@@ -83,6 +160,15 @@ class ExecutionPayload(BaseModel):
     fair_result: FAIRSimulationResult
     xai_trust: XAITrustResult
     rosi_result: ROSIOptimizationResult
+    # Phase-1 extension engines — optional so legacy 5-arg constructions
+    # remain valid; populated by _run_core_engines when inputs are supplied.
+    business_profile: Optional[BusinessProfileResult] = None
+    segment_risk: Optional[SegmentRiskResult] = None
+    control_maturity: Optional[ControlMaturityResult] = None
+    rosi_v2: Optional[ZRosiResult] = None
+    cia_exposure: Optional[CiaExposureResult] = None
+    domain_priority: Optional[List[DomainPriorityResult]] = None
+
 
 
 # ============================================================================
@@ -97,7 +183,11 @@ class PersonaType(str, Enum):
 
 class ChatRequest(BaseModel):
     session_id: str = Field(..., description="Unique conversation session identifier")
-    persona: PersonaType = Field(..., description="Target persona for response formatting")
+    # Optional: when absent, /chat auto-classifies via SemanticIntentRouter;
+    # the persona-specific routes default to their own persona.
+    persona: Optional[PersonaType] = Field(
+        default=None, description="Target persona for response formatting"
+    )
     prompt: str = Field(..., description="Natural language user query")
     context_overrides: Optional[Dict[str, Any]] = Field(
         default=None, description="Optional runtime context overrides"
@@ -110,6 +200,25 @@ class SlotExtractionResult(BaseModel):
     budget_limit: Optional[float] = Field(default=None, description="Budget limit in INR Lakhs")
     timeline_delta: Optional[int] = Field(default=None, description="Remediation delay in days")
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    # Phase-2 NLU extension slots (Task 8) — all optional; engines only run
+    # for the slots the user actually supplies (never guessed silently).
+    business_unit: Optional[str] = None
+    segment_name: Optional[str] = None
+    segment_revenue_pct: Optional[float] = Field(default=None, ge=0.0, le=100.0)
+    annual_revenue_cr: Optional[float] = None
+    sector: Optional[str] = None
+    country: Optional[str] = None
+    employee_count: Optional[int] = None
+    control_maturity: Optional[str] = None
+    efficacy_t: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    impact_operational: Optional[float] = Field(default=None, ge=0.0, le=10.0)
+    impact_financial: Optional[float] = Field(default=None, ge=0.0, le=10.0)
+    risk_w: Optional[float] = Field(default=None, ge=0.0, le=10.0)
+    t_w: Optional[float] = Field(default=None, ge=0.0, le=10.0)
+    cost_rate: Optional[float] = None
+    confidentiality: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    integrity: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    availability: Optional[float] = Field(default=None, ge=0.0, le=1.0)
 
 
 class AssetNode(BaseModel):
@@ -206,6 +315,13 @@ class DeterministicContextPayload(BaseModel):
     compliance_controls: List[ComplianceControl] = Field(default_factory=list)
     guardrail_passed: bool = True
     guardrail_errors: List[str] = Field(default_factory=list)
+    # Phase-2: extension engine results surfaced to the API surface
+    business_profile: Optional[BusinessProfileResult] = None
+    segment_risk: Optional[SegmentRiskResult] = None
+    control_maturity: Optional[ControlMaturityResult] = None
+    rosi_v2: Optional[ZRosiResult] = None
+    cia_exposure: Optional[CiaExposureResult] = None
+    domain_priority: Optional[List[DomainPriorityResult]] = None
 
 
 class ChatResponse(BaseModel):

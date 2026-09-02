@@ -144,18 +144,62 @@ class SanityGuardrailVerifier:
 
         # Check Gordon-Loeb economic viability consistency
         is_viable = None
-        if isinstance(payload, ExecutionPayload) and payload.rosi_result:
-            is_viable = payload.rosi_result.is_economically_viable
-        elif isinstance(payload, DeterministicContextPayload) and payload.milprosi:
-            is_viable = payload.milprosi.is_economically_viable
+        if isinstance(payload, ExecutionPayload):
+            if payload.rosi_result:
+                is_viable = payload.rosi_result.is_economically_viable
+            # Check Phase-1 extensions for ExecutionPayload
+            _add_phase1_extensions(payload, valid_nums)
+        elif isinstance(payload, DeterministicContextPayload):
+            if payload.milprosi:
+                is_viable = payload.milprosi.is_economically_viable
+            # Check Phase-1 extensions for DeterministicContextPayload
+            _add_phase1_extensions(payload, valid_nums)
 
         if is_viable is False:
             text_lower = text.lower()
             if "economically viable" in text_lower and "not economically viable" not in text_lower:
                 errors.append("Contradiction: Response claims spend is economically viable, but Gordon-Loeb ceiling is exceeded.")
 
+        # Banned-token lint (Phase 2)
+        banned_tokens = ["100% secure", "hack-proof", "guarantee", "bulletproof", "unhackable", "invulnerable"]
+        text_lower = text.lower()
+        for token in banned_tokens:
+            if token in text_lower:
+                errors.append(f"Banned token detected: '{token}'. Do not make absolute security claims.")
+
         passed = len(errors) == 0
         return passed, errors
+
+def _add_phase1_extensions(payload: Any, nums: Set[float]) -> None:
+    if getattr(payload, "business_profile", None):
+        nums.add(round(payload.business_profile.total_revenue_cr, 2))
+    if getattr(payload, "segment_risk", None):
+        nums.add(round(payload.segment_risk.seg_revenue_cr, 2))
+        nums.add(round(payload.segment_risk.seg_impact_cr, 2))
+        nums.add(round(payload.segment_risk.seg_risk_cr, 2))
+        nums.add(round(payload.segment_risk.impact_operational, 2))
+        nums.add(round(payload.segment_risk.impact_financial, 2))
+        nums.add(round(payload.segment_risk.risk_w, 2))
+        nums.add(round(payload.segment_risk.impact_w, 2))
+    if getattr(payload, "control_maturity", None):
+        nums.add(round(payload.control_maturity.maturity_multiplier, 2))
+        nums.add(round(payload.control_maturity.efficacy_t, 2))
+        nums.add(round(payload.control_maturity.control_efficacy_t, 2))
+    if getattr(payload, "rosi_v2", None):
+        nums.add(round(payload.rosi_v2.ale_cr, 2))
+        nums.add(round(payload.rosi_v2.z_rosi, 2))
+        nums.add(round(payload.rosi_v2.z_rosi, 1))
+        nums.add(round(payload.rosi_v2.cost_rate, 2))
+    if getattr(payload, "cia_exposure", None):
+        nums.add(round(payload.cia_exposure.confidentiality, 2))
+        nums.add(round(payload.cia_exposure.integrity, 2))
+        nums.add(round(payload.cia_exposure.availability, 2))
+        nums.add(round(payload.cia_exposure.exposure, 2))
+        nums.add(round(payload.cia_exposure.ale_cr, 2))
+    if getattr(payload, "domain_priority", None):
+        for dp in payload.domain_priority:
+            nums.add(round(dp.d_priority, 2))
+            nums.add(round(dp.impact_weight, 2))
 
     def verify(self, payload: Any, output_text: Any = None) -> Tuple[bool, List[str]]:
         """Alias for verify_financial_integrity."""

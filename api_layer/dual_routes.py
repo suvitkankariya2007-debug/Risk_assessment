@@ -12,9 +12,11 @@ import os
 import re
 import time
 import uuid
+import asyncio
 import json
 from typing import Dict, Any, List, Optional
 from fastapi import APIRouter, HTTPException, Body, UploadFile, File
+from fastapi.concurrency import run_in_threadpool
 
 # Helper to load .env manually
 def _load_env():
@@ -61,6 +63,12 @@ from core_engines.topology_graph import AssetTopologyGraph
 from core_engines.fair_model import FAIRRiskEngine
 from core_engines.xai_trust import XAITrustAuditor
 from core_engines.rosi_optimizer import ROSIOptimizer
+from core_engines.business_profile import build_business_profile
+from core_engines.segment_risk import compute_segment_risk
+from core_engines.control_maturity import evaluate_control_maturity
+from core_engines.rosi_v2 import compute_rosi_v2
+from core_engines.cia_exposure import compute_cia_exposure
+from core_engines.domain_priority import compute_domain_priorities
 from api_layer.synthesizer import (
     format_business_briefing,
     format_technical_diagnostic,
@@ -86,6 +94,26 @@ guardrail = SanityGuardrailVerifier()
 
 _CVE_PATTERN = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
 _BUDGET_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*(crores?|cr|lakhs?|l)\b", re.IGNORECASE)
+
+# Phase-2 NLU (Task 8): extension slot patterns. Numeric/text extension
+# inputs are captured as explicit "key: value" or "key = value" pairs so
+# nothing is ever guessed silently from prose.
+_KV_SLOT_PATTERN = re.compile(
+    r"\b(business_unit|segment_name|segment_revenue_pct|annual_revenue_cr|"
+    r"sector|country|employee_count|control_maturity|efficacy_t|"
+    r"impact_operational|impact_financial|risk_w|t_w|cost_rate|"
+    r"confidentiality|integrity|availability)\s*[:=]\s*"
+    r"([A-Za-z_][\w &/]*|-?\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+# Control maturity enum: only captured when tied to an explicit
+# maturity/controls mention, or the distinctive phrase "not implemented".
+_MATURITY_PATTERN = re.compile(
+    r"(?:maturity|controls?)\s*(?:is|are|level|:)?\s*"
+    r"(not[ -]?implemented|initial|repeatable|defined|managed|optimized)"
+    r"|\b(not[ -]?implemented)\b",
+    re.IGNORECASE,
+)
 
 NLU_SYSTEM_PROMPT = """You are the NLU (Natural Language Understanding) parser for the CyberRiskIQ Copilot.
 Analyze the user's raw text prompt and extract structured intent and entity slots.
@@ -133,7 +161,10 @@ def _call_llm_nlu(prompt: str) -> Optional[Dict[str, Any]]:
                 generation_config={"response_mime_type": "application/json"},
                 system_instruction=NLU_SYSTEM_PROMPT
             )
-            resp = model.generate_content(f"User Prompt: {prompt}")
+            resp = model.generate_content(
+                f"User Prompt: {prompt}",
+                request_options={"timeout": 2.0}
+            )
             if resp and resp.text:
                 return json.loads(resp.text.strip())
         except Exception as e:
@@ -143,7 +174,7 @@ def _call_llm_nlu(prompt: str) -> Optional[Dict[str, Any]]:
     if openai_key:
         try:
             import openai
-            client = openai.OpenAI(api_key=openai_key)
+            client = openai.OpenAI(api_key=openai_key, timeout=2.0)
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
                 response_format={"type": "json_object"},
@@ -158,7 +189,7 @@ def _call_llm_nlu(prompt: str) -> Optional[Dict[str, Any]]:
             
     return None
 
-def _handle_scan_analysis(prompt: str, session_id: str, persona: PersonaType, nlu_data: Dict[str, Any]) -> ChatResponse:
+async def _handle_scan_analysis(prompt: str, session_id: str, persona: PersonaType, nlu_data: Dict[str, Any]) -> ChatResponse:
     start_time = time.perf_counter()
     if not scan_ledger.is_loaded:
         text = (
@@ -213,38 +244,48 @@ def _handle_scan_analysis(prompt: str, session_id: str, persona: PersonaType, nl
             "Recommend remediation priorities based on severity."
         )
         
-    user_content = f"Vulnerability Scan Findings JSON:\n{findings_json}\n\nUser Question: {prompt}"
+    # Token-efficient format: send only essential fields for top 5 findings
+    efficient_findings = [{"cve": f.get("cve_id"), "asset": f.get("asset_name"), "cvss": f.get("cvss_score"), "desc": f.get("description")} for f in findings[:5]]
+    efficient_json = json.dumps(efficient_findings)
+    user_content = f"Vulnerability Scan Summary Data:\n{fallback_text}\nTop 5 Findings Data:\n{efficient_json}\n\nUser Question: {prompt}"
     
     # Try calling LLM to format nicely
     gemini_key = os.environ.get("GEMINI_API_KEY")
     openai_key = os.environ.get("OPENAI_API_KEY")
-    if gemini_key:
-        try:
-            import google.generativeai as genai
-            genai.configure(api_key=gemini_key)
-            model = genai.GenerativeModel(
-                model_name="gemini-3.6-flash",
-                system_instruction=system_instruction
-            )
-            resp = model.generate_content(user_content)
-            if resp and resp.text:
-                text = resp.text
-        except Exception:
-            pass
-    elif openai_key:
-        try:
-            import openai
-            client = openai.OpenAI(api_key=openai_key)
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": user_content},
-                ],
-            )
-            text = resp.choices[0].message.content
-        except Exception:
-            pass
+    
+    def _do_llm_formatting():
+        if gemini_key:
+            try:
+                import google.generativeai as genai
+                genai.configure(api_key=gemini_key)
+                model = genai.GenerativeModel(
+                    model_name="gemini-3.6-flash",
+                    system_instruction=system_instruction
+                )
+                resp = model.generate_content(user_content, request_options={"timeout": 2.0})
+                if resp and resp.text:
+                    return resp.text
+            except Exception:
+                pass
+        elif openai_key:
+            try:
+                import openai
+                client = openai.OpenAI(api_key=openai_key, timeout=2.0)
+                resp = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": system_instruction},
+                        {"role": "user", "content": user_content},
+                    ],
+                )
+                return resp.choices[0].message.content
+            except Exception:
+                pass
+        return None
+
+    llm_resp = await run_in_threadpool(_do_llm_formatting)
+    if llm_resp:
+        text = llm_resp
             
     context_payload = _build_dummy_context_payload(session_id, persona)
     if findings:
@@ -297,10 +338,46 @@ def _extract_slots(prompt: str) -> Dict[str, Any]:
             # Enrich from live scan data rather than static mock_kb
             pass  # lookup_vuln will use scan_ledger below
 
+    # ── Phase-2 extension slot capture (Task 8) ────────────────────────────
+    ext: Dict[str, Any] = {}
+    for m in _KV_SLOT_PATTERN.finditer(prompt):
+        key = m.group(1).lower()
+        raw = m.group(2).strip().rstrip(",.;")
+        try:
+            val: Any = float(raw)
+            if key == "employee_count" and float(val).is_integer():
+                val = int(val)
+        except ValueError:
+            val = raw
+        ext[key] = val
+
+    mm = _MATURITY_PATTERN.search(prompt)
+    if mm:
+        level = mm.group(1) or mm.group(2) or ""
+        ext.setdefault("control_maturity", level.lower().replace("-", " ").strip())
+
     return {
         "cve_id": cve_id,
         "asset_name": asset_name,
         "budget_lakhs": budget_lakhs,
+        # ── Phase-2 extension slots (absent → None; never guessed) ──────────
+        "business_unit": ext.get("business_unit"),
+        "segment_name": ext.get("segment_name"),
+        "segment_revenue_pct": ext.get("segment_revenue_pct"),
+        "annual_revenue_cr": ext.get("annual_revenue_cr"),
+        "sector": ext.get("sector"),
+        "country": ext.get("country"),
+        "employee_count": ext.get("employee_count"),
+        "control_maturity": ext.get("control_maturity"),
+        "efficacy_t": ext.get("efficacy_t"),
+        "impact_operational": ext.get("impact_operational"),
+        "impact_financial": ext.get("impact_financial"),
+        "risk_w": ext.get("risk_w"),
+        "t_w": ext.get("t_w"),
+        "cost_rate": ext.get("cost_rate"),
+        "confidentiality": ext.get("confidentiality"),
+        "integrity": ext.get("integrity"),
+        "availability": ext.get("availability"),
     }
 
 
@@ -310,11 +387,28 @@ def _run_core_engines(prompt: str, context_overrides: Optional[Dict[str, Any]] =
     if context_overrides:
         slots.update(context_overrides)
 
-    # 1. Resolve Asset Topology (safe fallback for unknown assets)
-    try:
-        topo_data = asset_graph.resolve_asset(slots.get("asset_name", "core_payment_switch"))
-    except (KeyError, Exception):
-        topo_data = asset_graph.resolve_asset("core_payment_switch")
+    # 1. Resolve Asset Topology — unknown assets map to an explicit
+    # UNRESOLVED_ASSET state (Phase 0b). Never silently substitute the
+    # demo asset; the caller proceeds with a generic unweighted profile
+    # and the response clearly labels the asset as unresolved.
+    asset_requested = slots.get("asset_name", "")
+    topo_data = None
+    if asset_requested:
+        try:
+            topo_data = asset_graph.resolve_asset(asset_requested)
+        except KeyError:
+            topo_data = None
+    if topo_data is None:
+        topo_data = {
+            "asset_name": "UNRESOLVED_ASSET",
+            "asset_replacement_cost_cr": 0.0,
+            "daily_revenue_impact_cr": 0.0,
+            "regulatory_tier": "UNRESOLVED",
+            "asset_id": "UNRESOLVED_ASSET",
+            "business_services": [],
+            "upstream_dependencies": [],
+            "downstream_dependencies": [],
+        }
 
     # Query ScanLedger first, then fall back to mock_kb
     vuln_info = None
@@ -342,6 +436,13 @@ def _run_core_engines(prompt: str, context_overrides: Optional[Dict[str, Any]] =
         "tag_local": "local" in vuln_info["tags"],
     }
 
+    # Phase 0a: use the REAL CVSS score/vector from the matched scan
+    # finding (uploaded scan data drives the output). 9.8 is only a
+    # fallback when no scan data carries a score.
+    cvss_score = float(vuln_info.get("cvss_score") or 9.8)
+    cvss_vector = str(vuln_info.get("cvss_vector") or "").strip() or \
+        "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+
     threat_context = ThreatContext(
         cve_id=slots["cve_id"],
         description=vuln_info["description"],
@@ -349,8 +450,8 @@ def _run_core_engines(prompt: str, context_overrides: Optional[Dict[str, Any]] =
         asset_replacement_cost_cr=topo_data["asset_replacement_cost_cr"],
         daily_revenue_impact_cr=topo_data["daily_revenue_impact_cr"],
         regulatory_tier=topo_data["regulatory_tier"],
-        cvss_base_score=9.8,
-        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        cvss_base_score=cvss_score,
+        cvss_vector=cvss_vector,
         features=features,
         ref_count=vuln_info["reference_count"],
         proposed_control_cost_lakhs=slots["budget_lakhs"],
@@ -457,6 +558,12 @@ def _build_context_payload(payload: ExecutionPayload, session_id: str, persona: 
         compliance_controls=[],
         guardrail_passed=True,
         guardrail_errors=[],
+        business_profile=payload.business_profile,
+        segment_risk=payload.segment_risk,
+        control_maturity=payload.control_maturity,
+        rosi_v2=payload.rosi_v2,
+        cia_exposure=payload.cia_exposure,
+        domain_priority=payload.domain_priority,
     )
 
 
@@ -627,11 +734,14 @@ async def chat_business(request: ChatRequest) -> ChatResponse:
     prompt = request.prompt or ""
 
     # Try LLM NLU parse first
-    nlu_data = _call_llm_nlu(prompt)
+    try:
+        nlu_data = await asyncio.wait_for(run_in_threadpool(_call_llm_nlu, prompt), timeout=2.0)
+    except asyncio.TimeoutError:
+        nlu_data = None
     if nlu_data:
         intent = nlu_data.get("intent", "UNIDENTIFIED")
         if intent == "SCAN_ANALYSIS":
-            return _handle_scan_analysis(prompt, request.session_id, PersonaType.BUSINESS, nlu_data)
+            return await _handle_scan_analysis(prompt, request.session_id, PersonaType.BUSINESS, nlu_data)
         elif intent in ["CONVERSATIONAL", "UNIDENTIFIED", "GENERAL_KNOWLEDGE"]:
             resp_text = synthesizer.generate_conversational_response(prompt, PersonaType.BUSINESS)
             context_payload = _build_dummy_context_payload(request.session_id, PersonaType.BUSINESS)
@@ -673,7 +783,7 @@ async def chat_business(request: ChatRequest) -> ChatResponse:
     # Classify query intent
     query_type = _analyze_query_intent(prompt)
     if query_type == "SCAN_ANALYSIS":
-        return _handle_scan_analysis(prompt, request.session_id, PersonaType.BUSINESS, {})
+        return await _handle_scan_analysis(prompt, request.session_id, PersonaType.BUSINESS, {})
     elif query_type in ["UNIDENTIFIED", "CONVERSATIONAL"]:
         return _handle_unidentified_or_conversational(prompt, request.session_id, PersonaType.BUSINESS, query_type)
     elif query_type == "GENERAL_KNOWLEDGE":
@@ -710,11 +820,14 @@ async def chat_technical(request: ChatRequest) -> ChatResponse:
     prompt = request.prompt or ""
 
     # Try LLM NLU parse first
-    nlu_data = _call_llm_nlu(prompt)
+    try:
+        nlu_data = await asyncio.wait_for(run_in_threadpool(_call_llm_nlu, prompt), timeout=2.0)
+    except asyncio.TimeoutError:
+        nlu_data = None
     if nlu_data:
         intent = nlu_data.get("intent", "UNIDENTIFIED")
         if intent == "SCAN_ANALYSIS":
-            return _handle_scan_analysis(prompt, request.session_id, PersonaType.TECHNICAL, nlu_data)
+            return await _handle_scan_analysis(prompt, request.session_id, PersonaType.TECHNICAL, nlu_data)
         elif intent in ["CONVERSATIONAL", "UNIDENTIFIED", "GENERAL_KNOWLEDGE"]:
             resp_text = synthesizer.generate_conversational_response(prompt, PersonaType.TECHNICAL)
             context_payload = _build_dummy_context_payload(request.session_id, PersonaType.TECHNICAL)
@@ -756,7 +869,7 @@ async def chat_technical(request: ChatRequest) -> ChatResponse:
     # Classify query intent
     query_type = _analyze_query_intent(prompt)
     if query_type == "SCAN_ANALYSIS":
-        return _handle_scan_analysis(prompt, request.session_id, PersonaType.TECHNICAL, {})
+        return await _handle_scan_analysis(prompt, request.session_id, PersonaType.TECHNICAL, {})
     elif query_type in ["UNIDENTIFIED", "CONVERSATIONAL"]:
         return _handle_unidentified_or_conversational(prompt, request.session_id, PersonaType.TECHNICAL, query_type)
     elif query_type == "GENERAL_KNOWLEDGE":

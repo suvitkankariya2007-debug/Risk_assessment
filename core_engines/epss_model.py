@@ -4,6 +4,26 @@ Grounded in Jacobs et al. (2021)
 
 16 Elastic Net features with canonical weights.
 Includes online incremental SGD learner for continuous retraining.
+
+Phase 0d fix: when a concrete CVE id is supplied, the real per-CVE exploit
+probability and percentile are fetched from the FIRST.org EPSS API
+(https://api.first.org/data/v1/epss) with a hard 2-second timeout. The
+offline logistic approximation below is kept strictly as a fallback for
+when the API is unreachable, rate-limited, or the CVE has no live record.
+"""
+import json
+import math
+import os
+import threading
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Optional, Tuple
+"""
+EPSS Exploit Prediction Engine
+Grounded in Jacobs et al. (2021)
+
+16 Elastic Net features with canonical weights.
+Includes online incremental SGD learner for continuous retraining.
 """
 import math
 from typing import Dict, List
@@ -13,6 +33,65 @@ from scipy import stats
 from sklearn.linear_model import SGDClassifier
 
 from schemas.data_models import EPSSPrediction
+
+
+# ── Live FIRST.org EPSS API (Phase 0d) ──────────────────────────────────────
+_EPSS_API_URL = "https://api.first.org/data/v1/epss"
+_EPSS_TIMEOUT_SEC = 2.0
+_EPSS_CACHE_TTL_SEC = 6 * 3600.0
+_EPSS_CACHE: Dict[str, Tuple[float, float, float]] = {}  # cve -> (ts, prob, pct)
+_executor = ThreadPoolExecutor(max_workers=2)
+
+
+def _live_epss_enabled() -> bool:
+    """Live API is on by default; set EPSS_DISABLE_LIVE=1 to force offline mode."""
+    return os.environ.get("EPSS_DISABLE_LIVE", "").strip().lower() not in (
+        "1", "true", "yes",
+    )
+
+
+def _fetch_live_epss(cve_id: str) -> Optional[Tuple[float, float]]:
+    """
+    Fetch the real (probability, percentile%) for a CVE from FIRST.org.
+
+    Hard 2-second wall-clock cap (a slow external API must never block the
+    chat response). Returns None on any failure/timeout so the caller falls
+    back to the offline logistic approximation. Results are cached for 6h.
+    """
+    import time as _time
+
+    key = cve_id.upper()
+    now = _time.monotonic()
+    cached = _EPSS_CACHE.get(key)
+    if cached and (now - cached[0]) < _EPSS_CACHE_TTL_SEC:
+        return (cached[1], cached[2])
+
+    def _do_request() -> Optional[Tuple[float, float]]:
+        try:
+            url = f"{_EPSS_API_URL}?cve={key}"
+            req = urllib.request.Request(url, headers={"User-Agent": "CyberRiskIQ/1.0"})
+            with urllib.request.urlopen(req, timeout=_EPSS_TIMEOUT_SEC) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            rows = data.get("data") or []
+            if not rows:
+                return None
+            prob = float(rows[0].get("epss", "nan"))
+            # FIRST.org returns percentile as a 0-1 fraction
+            pct = float(rows[0].get("percentile", "nan")) * 100.0
+            if math.isnan(prob) or math.isnan(pct):
+                return None
+            return (prob, pct)
+        except Exception:
+            return None
+
+    future = _executor.submit(_do_request)
+    try:
+        result = future.result(timeout=_EPSS_TIMEOUT_SEC)
+    except Exception:
+        return None
+    if result is not None:
+        _EPSS_CACHE[key] = (now, result[0], result[1])
+    return result
 
 
 class EPSSPredictor:
@@ -84,10 +163,22 @@ class EPSSPredictor:
             stats.norm.cdf(z, loc=self.INTERCEPT, scale=2.5) * 100.0
         )
 
+        live_epss = False
+        if cve_id and _live_epss_enabled():
+            live = _fetch_live_epss(cve_id)
+            if live is not None:
+                live_prob, live_percentile = live
+                if 0.0 <= live_prob <= 1.0:
+                    probability = live_prob
+                    percentile = live_percentile
+                    live_epss = True
+
         return EPSSPrediction(
             cve_id=cve_id,
             epss_probability=round(probability, 6),
             percentile=round(min(percentile, 100.0), 2),
+            z_score=round(z, 4),
+            live_epss=live_epss,
         )
 
     def continuous_online_update(self, telemetry_batch: List[Dict]) -> None:

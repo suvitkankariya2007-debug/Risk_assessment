@@ -266,7 +266,7 @@ def call_external_llm(prompt_instruction: str, data: Dict[str, Any], user_prompt
             import google.generativeai as genai
             genai.configure(api_key=gemini_key)
             model = genai.GenerativeModel(model_name="gemini-3.6-flash", system_instruction=prompt_instruction)
-            resp = model.generate_content(user_content)
+            resp = model.generate_content(user_content, request_options={"timeout": 2.0})
             return resp.text
         except Exception:
             pass
@@ -276,7 +276,7 @@ def call_external_llm(prompt_instruction: str, data: Dict[str, Any], user_prompt
     if LLM_PROVIDER == "openai" or (openai_key and not LLM_PROVIDER):
         try:
             import openai
-            client = openai.OpenAI(api_key=openai_key)
+            client = openai.OpenAI(api_key=openai_key, timeout=2.0)
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
@@ -293,7 +293,7 @@ def call_external_llm(prompt_instruction: str, data: Dict[str, Any], user_prompt
     if LLM_PROVIDER == "anthropic" or (anthropic_key and not LLM_PROVIDER):
         try:
             from anthropic import Anthropic
-            client = Anthropic(api_key=anthropic_key)
+            client = Anthropic(api_key=anthropic_key, timeout=2.0)
             resp = client.messages.create(
                 model="claude-3-5-sonnet-20241022",
                 max_tokens=1000,

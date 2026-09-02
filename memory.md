@@ -199,3 +199,32 @@ pytest tests/test_engines.py -v           # Core engine tests (21)
 pytest tests/test_api_layer.py -v         # API integration tests (8)
 pytest tests/test_chatbot_edge_cases.py -v  # Edge-case stress tests (17)
 ```
+
+---
+
+## Gap Analysis Audit (CyberRiskIQ_GapAnalysis.md)
+
+Following a context hard-limit crash, an audit was performed to check the real repository state against the `CyberRiskIQ_GapAnalysis.md` build prompt:
+
+### Phase 0: Real Data Fixes - **COMPLETED**
+*   **a. CVSS override:** Fixed. `api_layer/dual_routes.py` now reads the real score from the matched ScanFinding.
+*   **b. Topology fallback:** Fixed. Unmatched assets explicitly yield `UNRESOLVED_ASSET` via `KeyError` trapping.
+*   **c. Persistence:** Fixed. `api_layer/scan_ledger.py` uses SQLite.
+*   **d. EPSS API:** Fixed. `core_engines/epss_model.py` calls FIRST.org with a 2-second timeout via `ThreadPoolExecutor` and offline fallback.
+
+### Phase 1: New Risk-Quantification Modules - **CREATED BUT BROKEN**
+*   All new engine files (`business_profile.py`, `segment_risk.py`, `control_maturity.py`, `rosi_v2.py`, `cia_exposure.py`, `domain_priority.py`) were created.
+*   **Critical Bug:** `build_business_profile` function was never implemented in `business_profile.py` (only the `BusinessProfileEngine` class exists). This causes `ImportError` in `dual_routes.py` and completely breaks the `pytest` test suite (fails to collect tests).
+
+### Phase 2: Wiring & API Layer - **INCOMPLETE**
+*   **7. Schemas:** Done. `schemas/data_models.py` updated.
+*   **8. NLU Slots:** Done. `_extract_slots()` in `dual_routes.py` captures the new extensions via regex.
+*   **9. Synthesizer Templates:** **NOT DONE.** `api_layer/synthesizer.py` still outputs raw acronyms (`VaR`, `EAL`, `ROSI`) instead of plain-English sentences for the Executive persona, and the lint/banned token check is missing.
+*   **10. Guardrails:** **NOT DONE.** `api_layer/guardrails.py` (`_collect_payload_numbers`) ignores all new Phase 1 numeric fields (e.g., SegImpact, Exposure, etc.).
+*   **11. Tests:** **NOT DONE.** No tests were written for the new formulas in `tests/test_engines.py`.
+*   **12. Documentation:** Currently being updated by this audit.
+
+### Next Session Directives
+*   **Do not trust the previous test pass rates** — the test suite is currently hard-crashing (`ImportError` on collection).
+*   Must implement `build_business_profile` in `business_profile.py`.
+*   Must finish the remaining Phase 2 items (Synthesizer templates, Guardrails fields, and new tests).
