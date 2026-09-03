@@ -151,25 +151,53 @@ Ensure the output is strictly valid JSON.
 """
 
 def _call_llm_nlu(prompt: str) -> Optional[Dict[str, Any]]:
+    dynamic_prompt = NLU_SYSTEM_PROMPT
+    if scan_ledger.is_loaded:
+        dynamic_prompt += (
+            "\n\nCRITICAL CONTEXT: A vulnerability scan IS currently loaded in the system! "
+            "If the user asks general questions about where to invest, what to fix, or monetary terms "
+            "without explicitly naming an asset, ASSUME they want to analyze the uploaded scan and "
+            "strictly classify the intent as SCAN_ANALYSIS."
+        )
+        
     gemini_key = os.environ.get("GEMINI_API_KEY")
     if gemini_key:
         try:
-            import google.generativeai as genai
-            genai.configure(api_key=gemini_key)
-            model = genai.GenerativeModel(
-                model_name="gemini-3.6-flash",
-                generation_config={"response_mime_type": "application/json"},
-                system_instruction=NLU_SYSTEM_PROMPT
-            )
-            resp = model.generate_content(
-                f"User Prompt: {prompt}",
-                request_options={"timeout": 2.0}
+            from google import genai
+            from google.genai import types
+            client = genai.Client(api_key=gemini_key)
+            resp = client.models.generate_content(
+                model="gemini-3.6-flash",
+                contents=f"User Prompt: {prompt}",
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    system_instruction=dynamic_prompt,
+                )
             )
             if resp and resp.text:
                 return json.loads(resp.text.strip())
         except Exception as e:
             print(f"[NLU LLM] Gemini NLU call failed: {e}")
             
+    groq_key = os.environ.get("GROQ_API_KEY")
+    if groq_key:
+        try:
+            import openai, re
+            client = openai.OpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1", timeout=4.0)
+            resp = client.chat.completions.create(
+                model="qwen/qwen3.8-27b",
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": dynamic_prompt},
+                    {"role": "user", "content": f"User Prompt: {prompt}"},
+                ],
+            )
+            raw = resp.choices[0].message.content.strip()
+            raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+            return json.loads(raw)
+        except Exception as e:
+            print(f"[NLU LLM] Groq NLU call failed: {e}")
+
     openai_key = os.environ.get("OPENAI_API_KEY")
     if openai_key:
         try:
@@ -179,7 +207,7 @@ def _call_llm_nlu(prompt: str) -> Optional[Dict[str, Any]]:
                 model="gpt-4o-mini",
                 response_format={"type": "json_object"},
                 messages=[
-                    {"role": "system", "content": NLU_SYSTEM_PROMPT},
+                    {"role": "system", "content": dynamic_prompt},
                     {"role": "user", "content": f"User Prompt: {prompt}"},
                 ],
             )
@@ -218,7 +246,8 @@ async def _handle_scan_analysis(prompt: str, session_id: str, persona: PersonaTy
     assets = list(set(f.get("asset_name") for f in findings if f.get("asset_name")))
     
     fallback_text = (
-        f"VULNERABILITY SCAN SUMMARY:\n"
+        f"VULNERABILITY SCAN SUMMARY (Fallback Mode):\n"
+        f"Your Query: '{prompt}'\n"
         f"Total Ingested Findings: {total}\n"
         f"Severity Breakdown: Critical ({critical}), High ({high}), Medium ({medium})\n"
         f"Affected Assets: {', '.join(assets)}\n\n"
@@ -232,15 +261,15 @@ async def _handle_scan_analysis(prompt: str, session_id: str, persona: PersonaTy
     system_instruction = ""
     if persona == PersonaType.BUSINESS:
         system_instruction = (
-            "You are the CyberRiskIQ Business Copilot. Summarize the vulnerability scan findings for an executive audience. "
-            "Highlight the total number of findings, critical vulnerabilities, affected assets, and potential business/financial risks of not patching them. "
-            "Do not include technical jargon like CVSS vectors or raw CVE attributions in detail unless relevant to financial tiers. "
-            "Strictly do not hallucinate any math calculations, but explain the threat landscape based on the findings."
+            "You are the CyberRiskIQ Business Copilot. Analyze the vulnerability scan findings and DIRECTLY ANSWER the User Question for an executive audience. "
+            "Highlight the total number of findings, critical vulnerabilities, affected assets, and potential business/financial risks of not patching them where relevant to the user's question. "
+            "Do not include technical jargon like CVSS vectors or raw CVE attributions in detail. "
+            "Strictly do not hallucinate any math calculations."
         )
     else:
         system_instruction = (
-            "You are the CyberRiskIQ Technical Copilot. Provide a technical SecOps summary of the vulnerability scan findings. "
-            "List the CVEs, CVSS scores, threat indicators (weaponization, PoC), and affected assets. "
+            "You are the CyberRiskIQ Technical Copilot. Analyze the vulnerability scan findings and DIRECTLY ANSWER the User Question for a SecOps audience. "
+            "List the relevant CVEs, CVSS scores, threat indicators (weaponization, PoC), and affected assets. "
             "Recommend remediation priorities based on severity."
         )
         
@@ -251,23 +280,45 @@ async def _handle_scan_analysis(prompt: str, session_id: str, persona: PersonaTy
     
     # Try calling LLM to format nicely
     gemini_key = os.environ.get("GEMINI_API_KEY")
-    openai_key = os.environ.get("OPENAI_API_KEY")
+    groq_key = os.environ.get("GROQ_API_KEY")
     
     def _do_llm_formatting():
         if gemini_key:
             try:
-                import google.generativeai as genai
-                genai.configure(api_key=gemini_key)
-                model = genai.GenerativeModel(
-                    model_name="gemini-3.6-flash",
-                    system_instruction=system_instruction
+                from google import genai
+                from google.genai import types
+                client = genai.Client(api_key=gemini_key)
+                resp = client.models.generate_content(
+                    model="gemini-3.6-flash",
+                    contents=user_content,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                    )
                 )
-                resp = model.generate_content(user_content, request_options={"timeout": 2.0})
                 if resp and resp.text:
                     return resp.text
-            except Exception:
+            except Exception as e:
+                print("GEMINI API ERROR:", e)
                 pass
-        elif openai_key:
+        
+        if groq_key:
+            try:
+                import openai, re
+                client = openai.OpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1", timeout=4.0)
+                resp = client.chat.completions.create(
+                    model="qwen/qwen3.8-27b",
+                    messages=[
+                        {"role": "system", "content": system_instruction},
+                        {"role": "user", "content": user_content},
+                    ],
+                )
+                raw = resp.choices[0].message.content
+                return re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+            except Exception as e:
+                print("GROQ API ERROR:", e)
+                pass
+                
+        if openai_key:
             try:
                 import openai
                 client = openai.OpenAI(api_key=openai_key, timeout=2.0)

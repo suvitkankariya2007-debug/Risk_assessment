@@ -263,11 +263,35 @@ def call_external_llm(prompt_instruction: str, data: Dict[str, Any], user_prompt
     gemini_key = os.environ.get("GEMINI_API_KEY")
     if LLM_PROVIDER == "gemini" or (gemini_key and not LLM_PROVIDER):
         try:
-            import google.generativeai as genai
-            genai.configure(api_key=gemini_key)
-            model = genai.GenerativeModel(model_name="gemini-3.6-flash", system_instruction=prompt_instruction)
-            resp = model.generate_content(user_content, request_options={"timeout": 2.0})
+            from google import genai
+            from google.genai import types
+            client = genai.Client(api_key=gemini_key)
+            resp = client.models.generate_content(
+                model="gemini-3.6-flash",
+                contents=user_content,
+                config=types.GenerateContentConfig(
+                    system_instruction=prompt_instruction,
+                )
+            )
             return resp.text
+        except Exception:
+            pass
+
+    # Groq Wrapper Hook
+    groq_key = os.environ.get("GROQ_API_KEY")
+    if LLM_PROVIDER == "groq" or (groq_key and not LLM_PROVIDER):
+        try:
+            import openai, re
+            client = openai.OpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1", timeout=4.0)
+            resp = client.chat.completions.create(
+                model="qwen/qwen3.8-27b",
+                messages=[
+                    {"role": "system", "content": prompt_instruction},
+                    {"role": "user", "content": user_content},
+                ],
+            )
+            raw = resp.choices[0].message.content
+            return re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
         except Exception:
             pass
 
